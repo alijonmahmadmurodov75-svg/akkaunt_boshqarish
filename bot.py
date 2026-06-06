@@ -41,6 +41,8 @@ auto_tasks: dict[int, asyncio.Task] = {}
 manual_picks: dict[int, list]       = defaultdict(list)
 # akk_id -> {chat_id -> asyncio.Task}
 vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
+# akk_id -> {task, chat_id, nom, call} — aktiv VC sessiyalar
+vc_sessions: dict[int, dict]         = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -946,17 +948,64 @@ async def _avto_tsikl(akk_id):
 @dp.callback_query(F.data == "m:vc")
 async def vc_menu(cb: CallbackQuery, state: FSMContext):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    bosh   = await db.get_accounts_by_status("idle")
+    band   = await db.get_accounts_by_status("busy")
+    ichida = len(vc_sessions)
+    tugmalar = [
+        [("➕ Video chatga qo'shish", "vc:qosh")],
+    ]
+    if ichida > 0:
+        tugmalar.append([("🔄 Boshqa VC ga ko'chirish", "vc:kochir")])
+        tugmalar.append([("🚪 Hammasini chiqar", "vc:chiqar")])
+    tugmalar.append([("⬅️ Orqaga", "m:bosh")])
+    matn = (
+        f"🎥 <b>Video Chat</b>\n\n"
+        f"🟢 Bo'sh: {len(bosh)} ta\n"
+        f"🔴 Video chatda: {ichida} ta\n"
+    )
+    if vc_sessions:
+        matn += "\n<b>Hozir chatda:</b>\n"
+        for s in list(vc_sessions.values())[:10]:
+            matn += f"• {s['nom']}\n"
+    await xavfsiz_tahrir(cb, matn, ikb(tugmalar))
+
+@dp.callback_query(F.data == "vc:qosh")
+async def vc_qosh(cb: CallbackQuery, state: FSMContext):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
     bosh = await db.get_accounts_by_status("idle")
     if not bosh:
-        return await xavfsiz_tahrir(cb, "❌ Bo'sh akkunt yo'q.", ikb([[("⬅️","m:bosh")]]))
+        return await cb.answer("Bo'sh akkunt yo'q")
     await xavfsiz_tahrir(cb,
-        f"🎥 <b>Video Chat</b>\n\n"
-        f"🟢 Bo'sh: {len(bosh)} ta\n\n"
-        f"Video chat linkini yuboring:\n"
+        f"🎥 Video chat linkini yuboring:\n"
         f"<code>t.me/username?videochat</code>\n"
         f"<code>t.me/username?videochat=HASH</code>\n"
-        f"<code>t.me/+InviteKod?videochat</code>"
+        f"<code>t.me/+InviteKod?videochat</code>\n\n"
+        f"🟢 Bo'sh: {len(bosh)} ta"
     )
+    await state.set_state(VideoChat.link)
+
+@dp.callback_query(F.data == "vc:chiqar")
+async def vc_chiqar_hammasi(cb: CallbackQuery):
+    if not vc_sessions:
+        return await cb.answer("Video chatda hech kim yo'q")
+    soni = len(vc_sessions)
+    for s in list(vc_sessions.values()):
+        s["task"].cancel()
+    await cb.answer(f"🚪 {soni} ta chiqarilmoqda...")
+    await asyncio.sleep(0.5)
+    await vc_menu(cb, None)
+
+@dp.callback_query(F.data == "vc:kochir")
+async def vc_kochir_boshlash(cb: CallbackQuery, state: FSMContext):
+    if not vc_sessions:
+        return await cb.answer("Video chatda hech kim yo'q")
+    n = len(vc_sessions)
+    await xavfsiz_tahrir(cb,
+        f"🔄 <b>Boshqa VC ga ko'chirish</b>\n\n"
+        f"Hozir {n} ta akkunt video chatda\n\n"
+        f"Yangi video chat linkini yuboring:"
+    )
+    await state.update_data(kochirish=True)
     await state.set_state(VideoChat.link)
 
 @dp.message(VideoChat.link)
@@ -967,16 +1016,32 @@ async def vc_link_qabul(msg: Message, state: FSMContext):
             "❌ Link to'g'ri emas.\nFormat: <code>t.me/username?videochat</code>",
             parse_mode="HTML"
         )
-    bosh = await db.get_accounts_by_status("idle")
-    n    = len(bosh)
+    malumot   = await state.get_data()
+    kochirish = malumot.get("kochirish", False)
+    bosh      = await db.get_accounts_by_status("idle")
+    n         = len(bosh)
+
+    if kochirish:
+        # Ko'chirish rejimi — hozirgi barcha VC ni yangi chatga o'tkazamiz
+        band_list = list(vc_sessions.values())
+        nb        = len(band_list)
+        await state.clear()
+        await msg.answer(
+            f"🔄 {nb} ta akkunt yangi chatga ko'chirilmoqda...",
+            reply_markup=asosiy_menyu()
+        )
+        asyncio.create_task(_vc_kochirish_task(msg, band_list, link))
+        return
+
     await state.update_data(vc_link=link)
     await state.set_state(VideoChat.son)
     await msg.answer(
-        f"✅ Link qabul qilindi\n🟢 Bo'sh: {n} ta\n\nNechta akkunt kirsin?",
+        f"✅ Link qabul qilindi\n🟢 Bo'sh: {n} ta\n\n"
+        f"Nechta akkunt kirsin?\n(Raqam yozing yoki tugma bosing)",
         parse_mode="HTML",
         reply_markup=ikb([
-            [("🎥 2 ta","vcn:2"),("🎥 4 ta","vcn:4"),("🎥 6 ta","vcn:6")],
-            [("🎥 Hammasi ({})".format(n),"vcn:A")],
+            [("🎥 5 ta","vcn:5"),("🎥 10 ta","vcn:10"),("🎥 15 ta","vcn:15")],
+            [("🎥 Hammasi ({} ta)".format(n),"vcn:A")],
             [("❌ Bekor","vcn:bekor")],
         ])
     )
@@ -1086,6 +1151,10 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
                 _vc_keep_alive(akk_id, client, call, group_id, nom)
             )
             vc_ping_tasks[akk_id][group_id] = task
+            vc_sessions[akk_id] = {
+                "task": task, "chat_id": group_id,
+                "call": call, "nom": nom
+            }
 
             await db.update_account_status(akk_id, "busy")
             await db.add_log(akk_id, "vc_kirdi", link)
@@ -1139,6 +1208,10 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
                 _vc_keep_alive(akk_id, client, call, chat_id, nom)
             )
             vc_ping_tasks[akk_id][chat_id] = task
+            vc_sessions[akk_id] = {
+                "task": task, "chat_id": chat_id,
+                "call": call, "nom": nom
+            }
             await db.update_account_status(akk_id, "busy")
             await db.add_log(akk_id, "vc_kirdi_auto", str(chat_id))
             ok += 1
@@ -1162,6 +1235,51 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
     except Exception:
         pass
 
+
+
+async def _vc_kochirish_task(msg: Message, band_list: list, yangi_link: str):
+    """
+    Hozir video chatda turgan akkuntlarni yangi video chatga ko'chiradi:
+    1. Hozirgi chatdan chiqaradi (task.cancel())
+    2. Yangi chatga kiritadi
+    """
+    # 1. Hozirgi chatdan chiqarish
+    for ses in band_list:
+        try:
+            ses["task"].cancel()
+        except Exception:
+            pass
+    # Chiqishni kutamiz
+    await asyncio.sleep(3)
+
+    # 2. Yangi chatga kiritish — akk_id larni olamiz
+    akk_id_lar = [aid for aid in [s.get("akk_id") for s in band_list] if aid]
+    # band_list ichida akk_id yo'q — vc_ping_tasks dan topamiz
+    # To'g'riroq: DB dan busy akkuntlarni olamiz
+    busy_akkauntlar = await db.get_accounts_by_status("busy")
+    # + endi idle bo'lganlari ham (az oldin chiqdi)
+    idle_akkauntlar = await db.get_accounts_by_status("idle")
+
+    # Band bo'lganlarning nomi bo'yicha moslashtirish
+    band_nomlar = {s["nom"] for s in band_list}
+    tanlangan   = [
+        a for a in idle_akkauntlar
+        if (a["display_name"] or a["phone"]) in band_nomlar
+    ]
+
+    if not tanlangan:
+        # Hamma idle bo'ldi, lekin nom bo'yicha topmadik — barcha idle ni olamiz
+        tanlangan = idle_akkauntlar[:len(band_list)]
+
+    if not tanlangan:
+        try:
+            await msg.answer("❌ Ko'chirish uchun akkunt topilmadi.", reply_markup=asosiy_menyu())
+        except Exception:
+            pass
+        return
+
+    await asyncio.sleep(1)
+    await _vc_task(msg, tanlangan, yangi_link)
 
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
     """
@@ -1202,6 +1320,7 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
     await db.update_account_status(akk_id, "idle")
     if akk_id in vc_ping_tasks:
         vc_ping_tasks[akk_id].pop(chat_id, None)
+    vc_sessions.pop(akk_id, None)
     await db.add_log(akk_id, "vc_chiqdi", "admin" if admin_chiqardi else "kutilmagan")
 
 
