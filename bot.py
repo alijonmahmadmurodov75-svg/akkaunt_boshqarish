@@ -1717,67 +1717,34 @@ async def _vc_kochirish_task(msg: Message, band_list: list, yangi_link: str):
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
     """
     Akkuntni video chatda USHLAB TURADI.
-    - FAQAT task.cancel() (admin buyrug'i) kelganda chiqadi
-    - Har 20 sek da ulanishni saqlaydi
-    - Akkunt chiqib ketsa — qayta kiradi
-    - finally YO'Q — u har doim ishlaydi va chiqaradi
+    FAQAT task.cancel() — admin "Chiqar" bosdi.
+    Boshqa HECH NARSA chiqara olmaydi.
     """
     log.info(f"vc_keep_alive BOSHLANDI: {nom}")
-    admin_chiqardi = False
 
     while True:
         try:
-            await asyncio.sleep(20)
+            # Cheksiz uxlaymiz — faqat CancelledError kelganda uyg'onamiz
+            await asyncio.sleep(86400)  # 24 soat — amalda cancel kutamiz
         except asyncio.CancelledError:
-            admin_chiqardi = True
             log.info(f"vc_keep_alive CANCEL: {nom}")
             break
+        except Exception:
+            # Boshqa har qanday xato — davom etamiz, CHIQMAYMIZ
+            continue
 
-        # Ulanish tekshiruvi — uzilsa qayta ulanib VC ga qayta kirish
-        if not client.is_connected():
-            log.warning(f"vc: {nom} uzilgan, qayta ulanmoqda...")
-            try:
-                await client.connect()
-                log.info(f"vc: {nom} qayta ulandi, VC ga qayta kirilmoqda...")
-                # VC ga qayta kirish
-                import random as _rnd, json as _json
-                try:
-                    entity    = await client.get_entity(chat_id)
-                    full_info = await client(GetFullChannelRequest(entity))
-                    full_chat = full_info.full_chat
-                    if hasattr(full_chat, "call") and full_chat.call:
-                        ssrc   = _rnd.randint(100_000_000, 999_999_999)
-                        params = DataJSON(data=_json.dumps({
-                            "ufrag": f"uf{ssrc}", "pwd": f"pw{ssrc}",
-                            "fingerprints": [{"hash":"sha-256","fingerprint":"AA"*32}],
-                            "ssrc": ssrc, "ssrc-groups": []
-                        }))
-                        me = await client.get_input_entity("me")
-                        await client(JoinGroupCallRequest(
-                            call=full_chat.call, join_as=me, params=params,
-                            muted=True, video_stopped=True, invite_hash=None
-                        ))
-                        log.info(f"vc: {nom} ✅ VC ga qayta kirdi")
-                except Exception as e2:
-                    log.warning(f"vc: {nom} qayta kirish xato: {e2}")
-            except Exception as e:
-                log.warning(f"vc: {nom} qayta ulanish xato: {e}")
-
-    # Faqat admin chiqargan bo'lsa Leave yuboramiz
-    if admin_chiqardi:
-        try:
-            await client(LeaveGroupCallRequest(call=call, source=0))
-            log.info(f"vc: {nom} chiqdi (admin)")
-        except Exception as e:
-            log.warning(f"vc Leave {nom}: {e}")
-    else:
-        log.info(f"vc: {nom} — call tugadi yoki kutilmagan holat")
+    # Admin chiqardi — Leave yuboramiz
+    try:
+        await client(LeaveGroupCallRequest(call=call, source=0))
+        log.info(f"vc: {nom} chiqdi (admin buyrug'i)")
+    except Exception as e:
+        log.warning(f"vc Leave {nom}: {e}")
 
     await db.update_account_status(akk_id, "idle")
     if akk_id in vc_ping_tasks:
         vc_ping_tasks[akk_id].pop(chat_id, None)
     vc_sessions.pop(akk_id, None)
-    await db.add_log(akk_id, "vc_chiqdi", "admin" if admin_chiqardi else "call_tugadi")
+    await db.add_log(akk_id, "vc_chiqdi", "admin")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2002,4 +1969,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
