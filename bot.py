@@ -33,18 +33,19 @@ clients: dict[int, TelegramClient]  = {}
 group_activity: dict[int, list]     = defaultdict(list)
 auto_tasks: dict[int, asyncio.Task] = {}
 manual_picks: dict[int, list]       = defaultdict(list)
+vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
 
-# {akk_id: {chat_id: asyncio.Task}} — video chatda turgan akkuntlar
-vc_ping_tasks: dict[int, dict] = defaultdict(dict)
+# Aktiv VC sessiyalar: {akk_id: {"task": Task, "call_ref": ..., "chat_id": int, "nom": str}}
+vc_sessions: dict[int, dict] = {}
 
 
 # ── FSM holatlari ─────────────────────────────────────────────────────────────
 
 class AkkuntQoshish(StatesGroup):
-    telefon  = State()
-    kod      = State()
-    parol    = State()
-    nom      = State()
+    telefon = State()
+    kod     = State()
+    parol   = State()
+    nom     = State()
 
 class AdminQoshish(StatesGroup):
     id = State()
@@ -104,15 +105,6 @@ async def xavfsiz_tahrir(cb: CallbackQuery, matn: str, markup=None):
 
 
 def vc_link_tahlil(link: str):
-    """
-    Video chat linkidan username va hashni ajratadi.
-    Qo'llab-quvvatlanadigan formatlar:
-      t.me/username?videochat
-      t.me/username?videochat=HASH
-      t.me/username?voicechat=HASH
-      https://t.me/+InviteCode?videochat=HASH
-    Qaytaradi: (username, hash) yoki None
-    """
     link = link.strip()
     m = re.search(r"t\.me/([^?/\s]+)", link)
     if not m:
@@ -201,10 +193,10 @@ async def menu_holat(cb: CallbackQuery):
     akkauntlar = await db.get_all_accounts()
     if not akkauntlar:
         return await xavfsiz_tahrir(cb, "Akkunt yo'q.", ikb([[("⬅️", "m:bosh")]]))
-    bosh   = sum(1 for a in akkauntlar if a["status"] == "idle")
-    band   = sum(1 for a in akkauntlar if a["status"] == "busy")
-    pauza  = sum(1 for a in akkauntlar if a["status"] == "paused")
-    xato   = sum(1 for a in akkauntlar if a["status"] == "failed")
+    bosh  = sum(1 for a in akkauntlar if a["status"] == "idle")
+    band  = sum(1 for a in akkauntlar if a["status"] == "busy")
+    pauza = sum(1 for a in akkauntlar if a["status"] == "paused")
+    xato  = sum(1 for a in akkauntlar if a["status"] == "failed")
     qatorlar = [
         f"{holat_belgisi(a['status'])} <b>{a['display_name'] or a['phone']}</b> — {holat_nomi(a['status'])}"
         for a in akkauntlar
@@ -246,17 +238,13 @@ async def telefon_qabul(msg: Message, state: FSMContext):
         await state.clear()
         daqiqa = e.seconds // 60
         soat   = daqiqa // 60
-        if soat > 0:
-            vaqt = f"{soat} soat {daqiqa % 60} daqiqa"
-        else:
-            vaqt = f"{daqiqa} daqiqa"
+        vaqt   = f"{soat} soat {daqiqa % 60} daqiqa" if soat > 0 else f"{daqiqa} daqiqa"
         await msg.answer(
             f"⏳ <b>Telegram cheklash qo'ydi</b>\n\n"
             f"Bu raqamga juda ko'p kod yuborildi.\n"
             f"<b>{vaqt}</b> kutib, qaytadan urinib ko'ring.\n\n"
             f"Yoki boshqa raqam ishlating.",
-            parse_mode="HTML",
-            reply_markup=asosiy_menyu()
+            parse_mode="HTML", reply_markup=asosiy_menyu()
         )
     except Exception as e:
         await db.delete_account(akk_id)
@@ -305,7 +293,8 @@ async def nom_qabul(msg: Message, state: FSMContext):
     client = clients.get(akk_id)
     if client:
         await _handlerlarni_qoshish(akk_id, client)
-    await msg.answer(f"✅ Akkunt qo'shildi: <b>{nom}</b>", reply_markup=asosiy_menyu(), parse_mode="HTML")
+    await msg.answer(f"✅ Akkunt qo'shildi: <b>{nom}</b>",
+                     reply_markup=asosiy_menyu(), parse_mode="HTML")
 
 async def _sessiya_saqlash(msg: Message, state: FSMContext, akk_id: int, client: TelegramClient):
     men      = await client.get_me()
@@ -353,7 +342,7 @@ async def guruh_qoshilish(cb: CallbackQuery):
     cnt, link = cb.data[3:].split("|", 1)
     bosh = await db.get_accounts_by_status("idle")
     if not bosh: return await cb.answer("Bo'sh akkunt yo'q")
-    n       = len(bosh) if cnt == "A" else min(int(cnt), len(bosh))
+    n         = len(bosh) if cnt == "A" else min(int(cnt), len(bosh))
     tanlangan = random.sample(bosh, n)
     await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt guruhga qo'shilmoqda...")
     asyncio.create_task(_guruh_qoshish_task(cb.message, tanlangan, link, "guruh_qoshish"))
@@ -391,7 +380,7 @@ async def _guruh_qoshish_task(msg: Message, akkauntlar: list, link: str, amal: s
 @dp.callback_query(F.data == "m:monitor")
 async def menu_monitor(cb: CallbackQuery):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
-    guruhlar  = await db.get_monitored_groups()
+    guruhlar   = await db.get_monitored_groups()
     akkauntlar = await db.get_all_accounts()
     bosh = sum(1 for a in akkauntlar if a["status"] == "idle")
     band = sum(1 for a in akkauntlar if a["status"] == "busy")
@@ -444,10 +433,10 @@ async def ogohlantirish_amal(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("qt:"))
 async def qolda_tanlash(cb: CallbackQuery):
-    _, qolgan     = cb.data.split(":", 1)
+    _, qolgan      = cb.data.split(":", 1)
     akk_id_str, _ = qolgan.split("|", 1)
-    akk_id        = int(akk_id_str)
-    admin_id      = cb.from_user.id
+    akk_id         = int(akk_id_str)
+    admin_id       = cb.from_user.id
     if akk_id in manual_picks[admin_id]:
         manual_picks[admin_id].remove(akk_id)
         await cb.answer("➖ Olib tashlandi")
@@ -457,7 +446,7 @@ async def qolda_tanlash(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("qb:"))
 async def qolda_boshlash(cb: CallbackQuery):
-    guruh_id  = int(cb.data.split(":")[1])
+    guruh_id     = int(cb.data.split(":")[1])
     tanlanganlar = manual_picks.pop(cb.from_user.id, [])
     if not tanlanganlar: return await cb.answer("Hech narsa tanlanmadi")
     pool  = await db.get_pool()
@@ -479,7 +468,7 @@ async def menu_avto(cb: CallbackQuery):
     matn     = f"🗣 <b>Avto xabarlar</b>  (ishlaydi: {ishlaydi} ta)\n\n"
     matn    += "\n".join(qatorlar) if qatorlar else "So'z yo'q."
     await xavfsiz_tahrir(cb, matn, ikb([
-        [("➕ So'z qo'sh", "sx:qosh"), ("🗑 O'chir",    "sx:ochir")],
+        [("➕ So'z qo'sh", "sx:qosh"), ("🗑 O'chir",     "sx:ochir")],
         [("▶️ Boshlash",   "avto:bosh"), ("⏹ To'xtatish", "avto:toxt")],
         [("⬅️ Orqaga",     "m:bosh")],
     ]))
@@ -558,22 +547,43 @@ async def _avto_tsikl(akk_id: int):
 
 # ── Video Chat ────────────────────────────────────────────────────────────────
 
+def _vc_holat_xabari(bosh_soni: int) -> str:
+    if not vc_sessions:
+        return f"🎥 <b>Video Chat</b>\n\nHozir hech kim video chatda yo'q.\n\n🟢 Bo'sh akkauntlar: {bosh_soni} ta"
+    qatorlar = [f"🟢 {s['nom']}" for s in vc_sessions.values()]
+    return (
+        f"🎥 <b>Video Chatda ({len(vc_sessions)} ta):</b>\n\n"
+        + "\n".join(qatorlar)
+        + f"\n\n🟢 Bo'sh akkauntlar: {bosh_soni} ta"
+    )
+
+
 @dp.callback_query(F.data == "m:vc")
 async def vc_menu(cb: CallbackQuery, state: FSMContext):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
     bosh = await db.get_accounts_by_status("idle")
+    await xavfsiz_tahrir(cb, _vc_holat_xabari(len(bosh)), ikb([
+        [("➕ Qo'shish", "vc:qosh"), ("🚪 Hammasini chiqar", "vc:chiqar_hammasi")],
+        [("⬅️ Orqaga", "m:bosh")],
+    ]))
+
+
+@dp.callback_query(F.data == "vc:qosh")
+async def vc_qosh_boshlash(cb: CallbackQuery, state: FSMContext):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    bosh = await db.get_accounts_by_status("idle")
     if not bosh:
-        return await xavfsiz_tahrir(cb, "❌ Bo'sh akkunt yo'q.", ikb([[("⬅️", "m:bosh")]]))
+        return await cb.answer("❌ Bo'sh akkunt yo'q")
     await xavfsiz_tahrir(
         cb,
-        f"🎥 <b>Video Chat</b>\n\n"
-        f"🟢 Bo'sh akkauntlar: {len(bosh)} ta\n\n"
+        f"🎥 <b>Video Chat — qo'shish</b>\n\n"
+        f"🟢 Bo'sh: {len(bosh)} ta\n\n"
         f"Video chat linkini yuboring:\n"
         f"<code>t.me/username?videochat</code>\n"
-        f"<code>t.me/username?videochat=HASH</code>\n"
-        f"<code>t.me/username?voicechat=HASH</code>"
+        f"<code>t.me/username?videochat=HASH</code>"
     )
     await state.set_state(VideoChat.link)
+
 
 @dp.message(VideoChat.link)
 async def vc_link_qabul(msg: Message, state: FSMContext):
@@ -581,10 +591,8 @@ async def vc_link_qabul(msg: Message, state: FSMContext):
     tahlil = vc_link_tahlil(link)
     if not tahlil:
         return await msg.answer(
-            "❌ Link to'g'ri emas.\n\n"
-            "To'g'ri format:\n"
-            "<code>t.me/username?videochat</code>\n"
-            "<code>t.me/username?videochat=HASH</code>",
+            "❌ Link to'g'ri emas.\n\nTo'g'ri format:\n"
+            "<code>t.me/username?videochat</code>",
             parse_mode="HTML"
         )
     username, vc_hash = tahlil
@@ -593,17 +601,18 @@ async def vc_link_qabul(msg: Message, state: FSMContext):
     await state.update_data(vc_link=link, vc_username=username, vc_hash=vc_hash)
     await state.set_state(VideoChat.son)
     await msg.answer(
-        f"✅ Link qabul qilindi: <code>{username}</code>\n"
-        f"🟢 Bo'sh akkauntlar: {n} ta\n\n"
+        f"✅ Link: <code>{username}</code>\n"
+        f"🟢 Bo'sh: {n} ta\n\n"
         f"Nechta akkunt kirsin?\n"
         f"(Raqam yozing yoki tugma bosing)",
         parse_mode="HTML",
         reply_markup=ikb([
-            [("🎥 2 ta", "vcn:2"), ("🎥 4 ta", "vcn:4"), ("🎥 6 ta", "vcn:6")],
-            [("🎥 Hammasi ({})".format(n), "vcn:A")],
+            [("🎥 5 ta",  "vcn:5"),  ("🎥 10 ta", "vcn:10"), ("🎥 20 ta", "vcn:20")],
+            [("🎥 Hammasi ({} ta)".format(n), "vcn:A")],
             [("❌ Bekor", "vcn:bekor")],
         ])
     )
+
 
 @dp.message(VideoChat.son)
 async def vc_son_qabul(msg: Message, state: FSMContext):
@@ -619,6 +628,7 @@ async def vc_son_qabul(msg: Message, state: FSMContext):
     tanlangan = random.sample(bosh, n)
     await msg.answer(f"⏳ {n} ta akkunt video chatga qo'shilmoqda...", reply_markup=asosiy_menyu())
     asyncio.create_task(_vc_task(msg, tanlangan, malumot["vc_link"], malumot["vc_username"]))
+
 
 @dp.callback_query(F.data.startswith("vcn:"))
 async def vc_son_tugma(cb: CallbackQuery, state: FSMContext):
@@ -640,7 +650,6 @@ async def vc_son_tugma(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("vcal:"))
 async def vcal_amal(cb: CallbackQuery):
-    """Video chat boshlandi — admin javob tugmalari."""
     qiymat = cb.data[5:]
     if qiymat == "yoq":
         return await xavfsiz_tahrir(cb, "✅ E'tiborsiz qoldirildi.")
@@ -652,200 +661,203 @@ async def vcal_amal(cb: CallbackQuery):
     n         = len(bosh) if cnt == "A" else min(int(cnt), len(bosh))
     tanlangan = random.sample(bosh, n)
     await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt video chatga qo'shilmoqda...")
-    # chat_id dan username olish
     asyncio.create_task(_vc_task_by_id(cb.message, tanlangan, chat_id))
 
 
-async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
-    """Video chatga chat_id orqali qo'shilish (ogohlantirish tugmasidan)."""
+@dp.callback_query(F.data == "vc:chiqar_hammasi")
+async def vc_chiqar_hammasi(cb: CallbackQuery):
+    if not vc_sessions:
+        return await cb.answer("Video chatda hech kim yo'q")
+    soni = len(vc_sessions)
+    for ses in list(vc_sessions.values()):
+        ses["task"].cancel()
+    await cb.answer(f"🚪 {soni} ta akkunt chiqarilmoqda...")
+    await asyncio.sleep(0.5)
+    bosh = await db.get_accounts_by_status("idle")
+    await xavfsiz_tahrir(cb, _vc_holat_xabari(len(bosh)), ikb([
+        [("➕ Qo'shish", "vc:qosh"), ("🚪 Hammasini chiqar", "vc:chiqar_hammasi")],
+        [("⬅️ Orqaga", "m:bosh")],
+    ]))
+
+
+async def _vc_bitta_qoshish(akk: dict, entity, call_ref) -> bool:
     import json, random as rnd
-
-    ok = xato = 0
-    xato_sabablari = []
-
-    for akk in akkauntlar:
-        client = clients.get(akk["id"]) or await _client_yuklash(akk)
-        nom    = akk["display_name"] or akk["phone"]
-        if not client:
-            xato += 1
-            continue
-        try:
-            entity    = await client.get_entity(chat_id)
-            full_info = await client(GetFullChannelRequest(entity))
-            full_chat = full_info.full_chat
-
-            if not (hasattr(full_chat, "call") and full_chat.call):
-                xato_sabablari.append(f"• {nom}: call topilmadi")
-                xato += 1
-                continue
-
-            ssrc   = rnd.randint(100000000, 999999999)
-            params = json.dumps({
-                "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
-                "fingerprints": [], "ssrc": ssrc
-            })
-            me = await client.get_input_entity("me")
-            await client(JoinGroupCallRequest(
-                call=full_chat.call, join_as=me,
-                muted=True, video_stopped=True,
-                params=DataJSON(data=params), invite_hash=None
-            ))
-
-            # Keep-alive task
-            task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, full_chat.call, chat_id, nom)
-            )
-            vc_ping_tasks[akk["id"]][chat_id] = task
-
-            await db.update_account_status(akk["id"], "busy")
-            await db.add_log(akk["id"], "vc_kirdi_auto", str(chat_id))
-            ok += 1
-
-        except Exception as e:
-            xato_sabablari.append(f"• {nom}: {str(e)[:60]}")
-            log.error(f"vcal xato akk={akk['id']}: {e}")
-            xato += 1
-        await asyncio.sleep(random.randint(config.JOIN_DELAY_MIN, config.JOIN_DELAY_MAX))
-
-    natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
-    if xato_sabablari:
-        natija += "\n" + "\n".join(xato_sabablari[:5])
+    client = clients.get(akk["id"]) or await _client_yuklash(akk)
+    nom    = akk["display_name"] or akk["phone"]
+    if not client:
+        log.warning(f"vc: {nom} — client yuklanmadi")
+        return False
     try:
-        await msg.answer(natija, reply_markup=asosiy_menyu(), parse_mode="HTML")
-    except Exception:
-        pass
+        try:
+            await client(JoinChannelRequest(entity))
+        except Exception as e:
+            if "already" not in str(e).lower():
+                log.warning(f"vc JoinChannel {nom}: {e}")
 
+        ssrc   = rnd.randint(100000000, 999999999)
+        params = json.dumps({
+            "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
+            "fingerprints": [], "ssrc": ssrc
+        })
+        me = await client.get_input_entity("me")
+        await client(JoinGroupCallRequest(
+            call=call_ref, join_as=me,
+            muted=True, video_stopped=True,
+            params=DataJSON(data=params),
+            invite_hash=None
+        ))
+
+        task = asyncio.create_task(
+            _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
+        )
+        vc_sessions[akk["id"]] = {
+            "task":    task,
+            "call_ref": call_ref,
+            "chat_id": entity.id,
+            "nom":     nom,
+        }
+        vc_ping_tasks[akk["id"]][entity.id] = task
+        await db.update_account_status(akk["id"], "busy")
+        log.info(f"vc: {nom} ✅ kirdi")
+        return True
+    except Exception as e:
+        log.error(f"vc: {nom} kirish xato: {e}")
+        await db.update_account_status(akk["id"], "idle")
+        return False
 
 
 async def _vc_task(msg: Message, akkauntlar: list, link: str, username: str):
-    """
-    Video chatga qo'shilish + video chat tugaguncha ushlab turish.
-    """
-    import json, random as rnd
-
-    ok = xato = 0
-    xato_sabablari = []
-
+    # Entity va call_ref ni birinchi akkunt orqali olamiz
+    birinchi_client = None
+    birinchi_entity = None
     for akk in akkauntlar:
-        client = clients.get(akk["id"]) or await _client_yuklash(akk)
-        nom    = akk["display_name"] or akk["phone"]
-        if not client:
-            xato += 1
-            xato_sabablari.append(f"• {nom}: client yuklanmadi")
-            continue
-        try:
-            # 1. Kanalga a'zo bo'lish
-            entity = await client.get_entity(username)
-            try:
-                await client(JoinChannelRequest(entity))
-            except Exception as e:
-                if "already" not in str(e).lower():
-                    log.warning(f"vc kanal: {nom}: {e}")
+        c = clients.get(akk["id"]) or await _client_yuklash(akk)
+        if c:
+            birinchi_client = c
+            break
 
-            # 2. Aktiv call borligini tekshirish
-            full_info = await client(GetFullChannelRequest(entity))
-            full_chat  = full_info.full_chat
-
-            if not (hasattr(full_chat, "call") and full_chat.call):
-                xato_sabablari.append(f"• {nom}: aktiv video chat topilmadi")
-                await db.update_account_status(akk["id"], "idle")
-                xato += 1
-                continue
-
-            # 3. Video chatga qo'shilish
-            ssrc   = rnd.randint(100000000, 999999999)
-            params = json.dumps({
-                "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
-                "fingerprints": [], "ssrc": ssrc
-            })
-            me = await client.get_input_entity("me")
-            await client(JoinGroupCallRequest(
-                call=full_chat.call,
-                join_as=me,
-                muted=True,
-                video_stopped=True,
-                params=DataJSON(data=params),
-                invite_hash=None
-            ))
-
-            # 4. Video chat tugaguncha ushlab turuvchi task ishga tushurish
-            chat_id = full_chat.call.id
-            group_chat_id = entity.id
-            task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, full_chat.call, group_chat_id, nom)
-            )
-            vc_ping_tasks[akk["id"]][group_chat_id] = task
-
-            await db.update_account_status(akk["id"], "busy")
-            await db.add_log(akk["id"], "vc_kirdi", link)
-            log.info(f"vc: {nom} ✅ video chatga kirdi")
-            ok += 1
-
-        except Exception as e:
-            xato_str = str(e)
-            await db.update_account_status(akk["id"], "idle")
-            await db.add_log(akk["id"], "vc_xato", xato_str, "error")
-            xato_sabablari.append(f"• {nom}: {xato_str[:80]}")
-            log.error(f"vc_task xato akk={akk['id']}: {e}")
-            xato += 1
-
-        await asyncio.sleep(random.randint(config.JOIN_DELAY_MIN, config.JOIN_DELAY_MAX))
-
-    natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
-    if xato_sabablari:
-        natija += "\n\n<b>Tafsilotlar:</b>\n" + "\n".join(xato_sabablari[:5])
+    if not birinchi_client:
+        return await msg.answer("❌ Hech qanday akkunt ulana olmadi.", reply_markup=asosiy_menyu())
 
     try:
-        await msg.answer(natija, reply_markup=asosiy_menyu(), parse_mode="HTML")
+        birinchi_entity = await birinchi_client.get_entity(username)
+        full_info = await birinchi_client(GetFullChannelRequest(birinchi_entity))
+        full_chat = full_info.full_chat
+        if not (hasattr(full_chat, "call") and full_chat.call):
+            return await msg.answer(
+                "❌ Bu kanalda hozir aktiv video chat yo'q.",
+                reply_markup=asosiy_menyu()
+            )
+        call_ref = full_chat.call
+    except Exception as e:
+        return await msg.answer(f"❌ Kanal topilmadi: {e}", reply_markup=asosiy_menyu())
+
+    ok = xato = 0
+    for akk in akkauntlar:
+        if await _vc_bitta_qoshish(akk, birinchi_entity, call_ref):
+            ok += 1
+        else:
+            xato += 1
+        if ok + xato < len(akkauntlar):
+            await asyncio.sleep(random.randint(2, 5))
+
+    await db.add_log(None, "vc_qoshildi", f"{username}: {ok} kirdi, {xato} xato")
+    try:
+        await msg.answer(
+            f"🎥 <b>Video chat natija</b>\n"
+            f"✅ Kirdi: {ok}  ❌ Xato: {xato}\n\n"
+            f"Chiqarish: 🎥 Video chat → 🚪 Hammasini chiqar",
+            reply_markup=asosiy_menyu(), parse_mode="HTML"
+        )
     except Exception:
         pass
 
 
-async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
+async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
+    birinchi_client = None
+    for akk in akkauntlar:
+        c = clients.get(akk["id"]) or await _client_yuklash(akk)
+        if c:
+            birinchi_client = c
+            break
+
+    if not birinchi_client:
+        return await msg.answer("❌ Hech qanday akkunt ulana olmadi.", reply_markup=asosiy_menyu())
+
+    try:
+        entity    = await birinchi_client.get_entity(chat_id)
+        full_info = await birinchi_client(GetFullChannelRequest(entity))
+        full_chat = full_info.full_chat
+        if not (hasattr(full_chat, "call") and full_chat.call):
+            return await msg.answer(
+                "❌ Bu kanalda hozir aktiv video chat yo'q.",
+                reply_markup=asosiy_menyu()
+            )
+        call_ref = full_chat.call
+    except Exception as e:
+        return await msg.answer(f"❌ Kanal topilmadi: {e}", reply_markup=asosiy_menyu())
+
+    ok = xato = 0
+    for akk in akkauntlar:
+        if await _vc_bitta_qoshish(akk, entity, call_ref):
+            ok += 1
+        else:
+            xato += 1
+        if ok + xato < len(akkauntlar):
+            await asyncio.sleep(random.randint(2, 5))
+
+    try:
+        await msg.answer(
+            f"🎥 <b>Video chat natija</b>\n"
+            f"✅ Kirdi: {ok}  ❌ Xato: {xato}\n\n"
+            f"Chiqarish: 🎥 Video chat → 🚪 Hammasini chiqar",
+            reply_markup=asosiy_menyu(), parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+async def _vc_keep_alive(akk_id: int, client: TelegramClient, call_ref, chat_id: int, nom: str):
     """
-    Video chat tugaguncha akkuntni ushlab turadi.
-    Har 20 sekund da call holati tekshiriladi.
-    Call tugasa — akkunt chiqadi va holati idle ga qaytadi.
+    Akkuntni video chatda USHLAB TURADI.
+    Faqat task.cancel() — admin "Chiqar" bosdi yoki video chat o'zi tugadi.
+    GetFullChannelRequest ishlatilmaydi — har qanday xatoda CHIQMAYDI.
     """
     from telethon.tl.functions.phone import LeaveGroupCallRequest
 
-    log.info(f"vc_keep_alive boshlandi: {nom} chat={chat_id}")
+    log.info(f"vc_keep_alive boshlandi: {nom}")
     try:
         while True:
-            await asyncio.sleep(20)
-
-            # Call hali aktiv ekanligini tekshirish
+            await asyncio.sleep(30)
+            # Faqat ulanishni saqlash uchun oddiy ping
             try:
-                entity    = await client.get_entity(chat_id)
-                full_info = await client(GetFullChannelRequest(entity))
-                full_chat = full_info.full_chat
-
-                # Call tugagan yoki yo'q
-                if not (hasattr(full_chat, "call") and full_chat.call):
-                    log.info(f"vc: {nom} — call tugadi, chiqmoqda")
-                    break
-
+                if not client.is_connected():
+                    await client.connect()
+                await client.get_me()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                log.warning(f"vc_keep_alive tekshiruv xato {nom}: {e}")
-                # Xato bo'lsa ham davom etamiz
-                continue
+                # Xato bo'lsa ham CHIQMAYMIZ — davom etamiz
+                log.warning(f"vc ping xato {nom}: {e}")
 
     except asyncio.CancelledError:
-        log.info(f"vc_keep_alive bekor qilindi: {nom}")
+        log.info(f"vc_keep_alive to'xtatildi: {nom}")
     finally:
-        # Call tugaganda chiqish
         try:
-            await client(LeaveGroupCallRequest(call=call, source=0))
+            await client(LeaveGroupCallRequest(call=call_ref, source=0))
             log.info(f"vc: {nom} chiqdi")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"vc Leave xato {nom}: {e}")
         await db.update_account_status(akk_id, "idle")
-        # ping_tasks dan o'chirish
+        vc_sessions.pop(akk_id, None)
         if akk_id in vc_ping_tasks:
             vc_ping_tasks[akk_id].pop(chat_id, None)
+        await db.add_log(akk_id, "vc_chiqdi", "admin yoki call tugadi")
 
 
+# ── Sozlamalar ────────────────────────────────────────────────────────────────
 
+@dp.callback_query(F.data == "m:sozlamalar")
 async def menu_sozlamalar(cb: CallbackQuery):
     if not await bosh_admin_mi(cb.from_user.id):
         return await cb.answer("Faqat bosh admin")
@@ -874,7 +886,8 @@ async def adm_saqlash(msg: Message, state: FSMContext):
 @dp.callback_query(F.data == "adm:royxat")
 async def adm_royxat(cb: CallbackQuery):
     adminlar = await db.get_all_admins()
-    qatorlar = [f"• <code>{a['telegram_id']}</code> {a['username'] or ''} ({a['role']})" for a in adminlar]
+    qatorlar = [f"• <code>{a['telegram_id']}</code> {a['username'] or ''} ({a['role']})"
+                for a in adminlar]
     await xavfsiz_tahrir(cb, "👥 <b>Adminlar:</b>\n" + "\n".join(qatorlar),
                          ikb([[("⬅️ Orqaga", "m:sozlamalar")]]))
 
@@ -931,43 +944,22 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
 
     @client.on(events.Raw(UpdateGroupCall))
     async def vc_boshlandi(event):
-        """
-        Guruhda video/voice chat boshlansa xabar beradi.
-        UpdateGroupCall event: event.chat_id — guruh ID, event.call — GroupCall obyekti
-        """
         try:
-            call = event.call
-            # chat_id UpdateGroupCall da to'g'ridan-to'g'ri mavjud
+            call    = event.call
             chat_id = getattr(event, "chat_id", None)
             if chat_id is None:
                 return
-
-            # Kanallar uchun chat_id manfiy bo'ladi (-100XXXXXXXXXX)
-            # Telethon ba'zan musbat beradi, to'g'irlaymiz
-            if chat_id > 0:
-                neg_chat_id = int(f"-100{chat_id}")
-            else:
-                neg_chat_id = chat_id
-
+            neg_chat_id = int(f"-100{chat_id}") if chat_id > 0 else chat_id
             guruhlar = await db.get_monitored_groups()
-            # Ikkala formatda tekshiramiz
             guruh = next(
-                (g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)),
-                None
+                (g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None
             )
             if not guruh:
                 return
-
             if not isinstance(call, GroupCall):
                 return
-
-            # Tugagan call emas, rejali ham emas
-            discarded = getattr(call, "discarded", False)
-            schedule  = getattr(call, "schedule_date", None)
-            if discarded or schedule:
+            if getattr(call, "discarded", False) or getattr(call, "schedule_date", None):
                 return
-
-            # Video chat boshlandi!
             bosh = await db.get_accounts_by_status("idle")
             n    = len(bosh)
             matn = (
@@ -977,13 +969,11 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
                 f"Video chatga qo'shish kerakmi?"
             )
             await adminlarga_xabar(matn, ikb([
-                [("🎥 2 ta qo'sh", f"vcal:2|{neg_chat_id}"),
-                 ("🎥 4 ta qo'sh", f"vcal:4|{neg_chat_id}")],
-                [("🎥 Hammasi ({})".format(n), f"vcal:A|{neg_chat_id}")],
+                [("🎥 5 ta qo'sh",  f"vcal:5|{neg_chat_id}"),
+                 ("🎥 10 ta qo'sh", f"vcal:10|{neg_chat_id}")],
+                [("🎥 Hammasi ({} ta)".format(n), f"vcal:A|{neg_chat_id}")],
                 [("❌ Kerak emas", "vcal:yoq")],
             ]))
-            log.info(f"🎥 Video chat boshlandi: {guruh['group_name']} (chat_id={neg_chat_id})")
-
         except Exception as e:
             log.error(f"vc_boshlandi xato: {e}", exc_info=True)
 
