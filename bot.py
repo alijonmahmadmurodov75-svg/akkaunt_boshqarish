@@ -1815,21 +1815,36 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
             if getattr(call, "schedule_date", None): return
 
             # ── Video chat BOSHLANDI — adminga xabar ──
-            guruhlar = await db.get_monitored_groups()
-            guruh = next((g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None)
-            if not guruh: return
+            # Monitoring guruhlarida nom bor, boshqalarida chat_id ko'rsatamiz
+            guruhlar  = await db.get_monitored_groups()
+            guruh     = next((g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None)
+
+            # Guruh nomini aniqlash — monitoring da bo'lmasa client orqali olamiz
+            guruh_nom = None
+            if guruh:
+                guruh_nom = guruh["group_name"]
+            else:
+                # Istalgan guruh/kanalda VC — nom olishga urinib ko'ramiz
+                try:
+                    entity    = await client.get_entity(neg_chat_id)
+                    guruh_nom = getattr(entity, "title", None) or str(neg_chat_id)
+                except Exception:
+                    guruh_nom = str(neg_chat_id)
 
             bosh = await db.get_accounts_by_status("idle")
             n    = len(bosh)
             await adminlarga_xabar(
-                f"🎥 <b>Video chat boshlandi!</b>\n📍 <b>{guruh['group_name']}</b>\n🟢 Bo'sh: {n} ta\n\nQo'shish?",
+                f"🎥 <b>Video chat boshlandi!</b>\n"
+                f"📍 <b>{guruh_nom}</b>\n"
+                f"{'🟡 Monitoring da YO\'Q — qo\'lda link kering' if not guruh else ''}\n"
+                f"🟢 Bo\'sh: {n} ta\n\nQo\'shish?",
                 ikb([
                     [("🎥 5 ta",f"vcal:5|{neg_chat_id}"),("🎥 10 ta",f"vcal:10|{neg_chat_id}")],
                     [("🎥 Hammasi ({} ta)".format(n),f"vcal:A|{neg_chat_id}")],
                     [("❌ Kerak emas","vcal:yoq")],
                 ])
             )
-            log.info(f"VC boshlandi: {guruh['group_name']} ({neg_chat_id})")
+            log.info(f"VC boshlandi: {guruh_nom} ({neg_chat_id})")
         except Exception as e:
             log.error(f"vc_boshlandi xato: {e}", exc_info=True)
 
