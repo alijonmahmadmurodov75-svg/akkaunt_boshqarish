@@ -1568,44 +1568,71 @@ async def _vc_kochirish_task(msg: Message, band_list: list, yangi_link: str):
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
     """
     Akkuntni video chatda USHLAB TURADI.
-    FAQAT task.cancel() kelganda chiqadi.
-    finally yo'q — u har doim ishlaydi va akkuntni chiqaradi.
+    - FAQAT task.cancel() (admin buyrug'i) kelganda chiqadi
+    - Har 20 sek da ulanishni saqlaydi
+    - Akkunt chiqib ketsa — qayta kiradi
+    - finally YO'Q — u har doim ishlaydi va chiqaradi
     """
-    log.info(f"vc_keep_alive: {nom} boshlandi")
+    log.info(f"vc_keep_alive BOSHLANDI: {nom}")
     admin_chiqardi = False
 
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
         except asyncio.CancelledError:
             admin_chiqardi = True
+            log.info(f"vc_keep_alive CANCEL: {nom}")
             break
 
-        # Har 30 sekundda oddiy ping — ulanishni saqlash
+        # Ulanishni saqlash
         try:
             if not client.is_connected():
                 await client.connect()
-            await client.get_me()
         except asyncio.CancelledError:
             admin_chiqardi = True
             break
         except Exception as e:
-            # Xato bo'lsa ham DAVOM ETAMIZ — chiqmaymiz
-            log.warning(f"vc ping {nom}: {e}")
+            log.warning(f"vc reconnect {nom}: {e}")
+            continue
+
+        # Akkunt hali callda ekanligini tekshirish
+        # Agar chiqib ketgan bo'lsa — qayta kiramiz
+        try:
+            entity    = await client.get_entity(chat_id)
+            full_info = await client(GetFullChannelRequest(entity))
+            full_chat = full_info.full_chat
+
+            if not (hasattr(full_chat, "call") and full_chat.call):
+                # Call tugagan — admin chiqarmagan, o'zimiz chiqdik
+                log.info(f"vc: {nom} — call tugadi")
+                break
+
+            # Call hali aktiv — participants tekshiramiz
+            # Oddiy ping yetarli, davom etamiz
+            log.debug(f"vc ping OK: {nom}")
+
+        except asyncio.CancelledError:
+            admin_chiqardi = True
+            break
+        except Exception as e:
+            # Xato bo'lsa ham CHIQMAYMIZ
+            log.warning(f"vc check {nom}: {e}")
 
     # Faqat admin chiqargan bo'lsa Leave yuboramiz
     if admin_chiqardi:
         try:
             await client(LeaveGroupCallRequest(call=call, source=0))
-            log.info(f"vc: {nom} chiqdi (admin buyrug'i)")
+            log.info(f"vc: {nom} chiqdi (admin)")
         except Exception as e:
-            log.warning(f"vc Leave xato {nom}: {e}")
+            log.warning(f"vc Leave {nom}: {e}")
+    else:
+        log.info(f"vc: {nom} — call tugadi yoki kutilmagan holat")
 
     await db.update_account_status(akk_id, "idle")
     if akk_id in vc_ping_tasks:
         vc_ping_tasks[akk_id].pop(chat_id, None)
     vc_sessions.pop(akk_id, None)
-    await db.add_log(akk_id, "vc_chiqdi", "admin" if admin_chiqardi else "kutilmagan")
+    await db.add_log(akk_id, "vc_chiqdi", "admin" if admin_chiqardi else "call_tugadi")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
