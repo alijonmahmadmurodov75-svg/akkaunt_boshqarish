@@ -38,6 +38,7 @@ dp  = Dispatcher(storage=MemoryStorage())
 clients: dict[int, TelegramClient]  = {}
 group_activity: dict[int, list]     = defaultdict(list)
 auto_tasks: dict[int, asyncio.Task] = {}
+reply_tasks: dict[int, asyncio.Task] = {}  # akk_id -> reply task
 manual_picks: dict[int, list]       = defaultdict(list)
 # akk_id -> {chat_id -> asyncio.Task}
 vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
@@ -60,6 +61,14 @@ class AdminQoshish(StatesGroup):
 
 class SozQoshish(StatesGroup):
     soz = State()
+
+class AvtoXabarSozlash(StatesGroup):
+    min_interval = State()
+    max_interval = State()
+
+class ReplyQoshish(StatesGroup):
+    trigger = State()
+    javob   = State()
 
 class GuruhQoshilish(StatesGroup):
     link = State()
@@ -860,53 +869,267 @@ async def qolda_boshlash(cb: CallbackQuery):
 async def menu_avto(cb: CallbackQuery):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
     sozlar   = await db.get_all_words()
+    replys   = await db.get_all_replies()
+    soz_s    = await db.get_avto_sozlamalar()
     ishlaydi = sum(1 for t in auto_tasks.values() if not t.done())
-    qatorlar = [f"{s['id']}. {s['word']} {'✅' if s['is_active'] else '❌'}" for s in sozlar]
-    matn     = f"🗣 <b>Avto xabarlar</b> (ishlaydi: {ishlaydi})\n\n"
-    matn    += "\n".join(qatorlar) if qatorlar else "So'z yo'q."
+    r_ishl   = sum(1 for t in reply_tasks.values() if not t.done())
+
+    matn = "🗣 <b>Avto Xabar</b>\n\n"
+    matn += "<b>Xabarlar ({} ta):</b>\n".format(len(sozlar))
+    for s in sozlar[:5]:
+        matn += "  {} {}\n".format("✅" if s["is_active"] else "❌", s["word"][:30])
+    if len(sozlar) > 5:
+        matn += "  ...va {} ta yana\n".format(len(sozlar)-5)
+    matn += "\n<b>Interval:</b> {}-{} soniya\n".format(soz_s["min_interval"], soz_s["max_interval"])
+    matn += "<b>Guruhga:</b> {} | <b>Lichkaga:</b> {}\n".format(
+        "✅" if soz_s["guruh_aktiv"] else "❌",
+        "✅" if soz_s["lichka_aktiv"] else "❌"
+    )
+    matn += "<b>Avto xabar:</b> {} ta | <b>Reply:</b> {} ta\n\n".format(ishlaydi, r_ishl)
+    matn += "<b>Auto Reply ({} ta):</b>\n".format(len(replys))
+    for r in replys[:3]:
+        matn += "  {} \"{}\" → \"{}\"\n".format(
+            "✅" if r["is_active"] else "❌",
+            r["trigger"][:15], r["javob"][:20]
+        )
+    if len(replys) > 3:
+        matn += "  ...va {} ta yana\n".format(len(replys)-3)
+
     await xavfsiz_tahrir(cb, matn, ikb([
-        [("➕ So'z qo'sh","sx:qosh"),("🗑 O'chir","sx:ochir")],
-        [("▶️ Boshlash","avto:bosh"),("⏹ To'xtatish","avto:toxt")],
-        [("⬅️ Orqaga","m:bosh")],
+        [("📝 Xabarlar", "ax:xabarlar"), ("🔄 Reply", "ax:reply")],
+        [("⚙️ Sozlamalar", "ax:sozlamalar")],
+        [("▶️ Boshlash", "avto:bosh"), ("⏹ To'xtatish", "avto:toxt")],
+        [("⬅️ Orqaga", "m:bosh")],
+    ]))
+
+
+# ── Xabarlar ──────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "ax:xabarlar")
+async def ax_xabarlar(cb: CallbackQuery):
+    sozlar   = await db.get_all_words()
+    qatorlar = ["{}. {} {}".format(s["id"], "✅" if s["is_active"] else "❌", s["word"]) for s in sozlar]
+    matn     = "📝 <b>Xabarlar ro'yxati:</b>\n\n" + ("\n".join(qatorlar) if qatorlar else "Hech narsa yo'q.")
+    await xavfsiz_tahrir(cb, matn, ikb([
+        [("➕ Qo'sh", "sx:qosh"), ("🗑 O'chir", "sx:ochir")],
+        [("⬅️ Orqaga", "m:avto")],
     ]))
 
 @dp.callback_query(F.data == "sx:qosh")
 async def soz_qosh(cb: CallbackQuery, state: FSMContext):
-    await xavfsiz_tahrir(cb, "Yangi so'z kiriting:")
+    await xavfsiz_tahrir(
+        cb,
+        "Yangi xabar matnini kiriting:\n\n<i>Bir nechta qo'shish uchun har satrga bitta yozing</i>"
+    )
     await state.set_state(SozQoshish.soz)
 
 @dp.message(SozQoshish.soz)
 async def soz_saqlash(msg: Message, state: FSMContext):
-    await db.add_word(msg.text.strip(), msg.from_user.id)
+    qatorlar = [q.strip() for q in msg.text.strip().split("\n") if q.strip()]
+    for q in qatorlar:
+        await db.add_word(q, msg.from_user.id)
     await state.clear()
-    await msg.answer("✅ So'z qo'shildi", reply_markup=asosiy_menyu())
+    await msg.answer("✅ {} ta xabar qo'shildi".format(len(qatorlar)), reply_markup=asosiy_menyu())
 
 @dp.callback_query(F.data == "sx:ochir")
 async def soz_ochir_royxat(cb: CallbackQuery):
     sozlar = await db.get_all_words()
-    if not sozlar: return await cb.answer("So'z yo'q")
-    qatorlar = [[(f"🗑 {s['word']}",f"sd:{s['id']}")] for s in sozlar]
-    qatorlar.append([("⬅️ Orqaga","m:avto")])
-    await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lgan so'zni tanlang:", ikb(qatorlar))
+    if not sozlar: return await cb.answer("Xabar yo'q")
+    qatorlar = [[(s["word"][:30], "sd:{}".format(s["id"]))] for s in sozlar]
+    qatorlar.append([("⬅️ Orqaga", "ax:xabarlar")])
+    await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lganni tanlang:", ikb(qatorlar))
 
 @dp.callback_query(F.data.startswith("sd:"))
 async def soz_ochir(cb: CallbackQuery):
     await db.delete_word(int(cb.data.split(":")[1]))
     await cb.answer("🗑 O'chirildi")
-    cb.data = "sx:ochir"
-    await soz_ochir_royxat(cb)
+    cb.data = "ax:xabarlar"
+    await ax_xabarlar(cb)
+
+
+# ── Sozlamalar ─────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "ax:sozlamalar")
+async def ax_sozlamalar(cb: CallbackQuery):
+    soz  = await db.get_avto_sozlamalar()
+    matn = (
+        "⚙️ <b>Avto xabar sozlamalari</b>\n\n"
+        "Interval: <b>{}-{}</b> soniya\n"
+        "Guruhga yuborish: <b>{}</b>\n"
+        "Lichkaga yuborish: <b>{}</b>"
+    ).format(
+        soz["min_interval"], soz["max_interval"],
+        "✅ Yoqilgan" if soz["guruh_aktiv"] else "❌ O'chirilgan",
+        "✅ Yoqilgan" if soz["lichka_aktiv"] else "❌ O'chirilgan"
+    )
+    g_txt = "❌ Guruhni o'chir" if soz["guruh_aktiv"] else "✅ Guruhni yoq"
+    l_txt = "❌ Lichkani o'chir" if soz["lichka_aktiv"] else "✅ Lichkani yoq"
+    await xavfsiz_tahrir(cb, matn, ikb([
+        [("⏱ Intervalni o'zgar", "ax:interval")],
+        [(g_txt, "ax:toggle_guruh")],
+        [(l_txt, "ax:toggle_lichka")],
+        [("⬅️ Orqaga", "m:avto")],
+    ]))
+
+@dp.callback_query(F.data == "ax:toggle_guruh")
+async def ax_toggle_guruh(cb: CallbackQuery):
+    soz = await db.get_avto_sozlamalar()
+    await db.update_avto_sozlamalar(guruh_aktiv=not soz["guruh_aktiv"])
+    await cb.answer("✅ O'zgartirildi")
+    await ax_sozlamalar(cb)
+
+@dp.callback_query(F.data == "ax:toggle_lichka")
+async def ax_toggle_lichka(cb: CallbackQuery):
+    soz = await db.get_avto_sozlamalar()
+    await db.update_avto_sozlamalar(lichka_aktiv=not soz["lichka_aktiv"])
+    await cb.answer("✅ O'zgartirildi")
+    await ax_sozlamalar(cb)
+
+@dp.callback_query(F.data == "ax:interval")
+async def ax_interval(cb: CallbackQuery, state: FSMContext):
+    await xavfsiz_tahrir(cb, "Minimal intervalni kiriting (soniya):\n<i>Masalan: 30</i>")
+    await state.set_state(AvtoXabarSozlash.min_interval)
+
+@dp.message(AvtoXabarSozlash.min_interval)
+async def ax_min_qabul(msg: Message, state: FSMContext):
+    if not msg.text.strip().isdigit():
+        return await msg.answer("❌ Faqat raqam kiriting.")
+    await state.update_data(mn=int(msg.text.strip()))
+    await state.set_state(AvtoXabarSozlash.max_interval)
+    await msg.answer("Maksimal intervalni kiriting (soniya):")
+
+@dp.message(AvtoXabarSozlash.max_interval)
+async def ax_max_qabul(msg: Message, state: FSMContext):
+    if not msg.text.strip().isdigit():
+        return await msg.answer("❌ Faqat raqam kiriting.")
+    malumot = await state.get_data()
+    mn = malumot["mn"]
+    mx = int(msg.text.strip())
+    if mx <= mn:
+        return await msg.answer("❌ Maksimal minimal dan katta bo'lishi kerak.")
+    await db.update_avto_sozlamalar(min_interval=mn, max_interval=mx)
+    await state.clear()
+    await msg.answer("✅ Interval: {}-{} soniya".format(mn, mx), reply_markup=asosiy_menyu())
+
+
+# ── Auto Reply ─────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "ax:reply")
+async def ax_reply_menu(cb: CallbackQuery):
+    replys = await db.get_all_replies()
+    r_ishl = sum(1 for t in reply_tasks.values() if not t.done())
+    qatorlar = []
+    for r in replys:
+        tur = {"guruh": "👥", "lichka": "👤", "both": "👥👤"}.get(r["tur"], "?")
+        qatorlar.append("{} {} <code>{}</code> → {}".format(
+            "✅" if r["is_active"] else "❌", tur,
+            r["trigger"][:20], r["javob"][:25]
+        ))
+    matn = "🔄 <b>Auto Reply</b> (ishlaydi: {})\n\n".format(r_ishl)
+    matn += "\n".join(qatorlar) if qatorlar else "Hech narsa yo'q."
+    matn += "\n\n<i>Trigger so'z xabarda bo'lsa — akkunt avtomatik javob beradi</i>"
+    await xavfsiz_tahrir(cb, matn, ikb([
+        [("➕ Qo'sh", "rp:qosh"), ("🗑 O'chir", "rp:ochir")],
+        [("▶️ Reply boshlash", "reply:bosh"), ("⏹ To'xtatish", "reply:toxt")],
+        [("⬅️ Orqaga", "m:avto")],
+    ]))
+
+@dp.callback_query(F.data == "rp:qosh")
+async def rp_qosh(cb: CallbackQuery, state: FSMContext):
+    await xavfsiz_tahrir(
+        cb,
+        "➕ <b>Reply qo'shish</b>\n\n"
+        "Trigger so'z kiriting:\n"
+        "<i>Bu so'z xabarda bo'lsa akkunt javob beradi</i>\n\n"
+        "Masalan: <code>narx</code>, <code>salom</code>, <code>price</code>"
+    )
+    await state.set_state(ReplyQoshish.trigger)
+
+@dp.message(ReplyQoshish.trigger)
+async def rp_trigger_qabul(msg: Message, state: FSMContext):
+    await state.update_data(trigger=msg.text.strip().lower(), tur="both")
+    await msg.answer(
+        "Trigger: <code>{}</code>\n\nQayerga javob bersin?".format(msg.text.strip()),
+        parse_mode="HTML",
+        reply_markup=ikb([
+            [("👥 Faqat guruh", "rpt:guruh"), ("👤 Faqat lichka", "rpt:lichka")],
+            [("👥👤 Ikkalasi", "rpt:both")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("rpt:"), ReplyQoshish.trigger)
+@dp.callback_query(F.data.startswith("rpt:"), ReplyQoshish.javob)
+async def rp_tur_tanlash(cb: CallbackQuery, state: FSMContext):
+    tur = cb.data.split(":")[1]
+    await state.update_data(tur=tur)
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer("Javob matnini yozing:")
+    await state.set_state(ReplyQoshish.javob)
+
+@dp.message(ReplyQoshish.javob)
+async def rp_javob_qabul(msg: Message, state: FSMContext):
+    malumot = await state.get_data()
+    trigger = malumot.get("trigger", "")
+    tur     = malumot.get("tur", "both")
+    javob   = msg.text.strip()
+    await db.add_reply(trigger, javob, tur)
+    await state.clear()
+    tur_txt = {"guruh": "Guruh", "lichka": "Lichka", "both": "Ikkalasi"}.get(tur, "?")
+    await msg.answer(
+        "✅ Reply qo'shildi!\nTrigger: <code>{}</code>\nJavob: {}\nTuri: {}".format(trigger, javob, tur_txt),
+        parse_mode="HTML", reply_markup=asosiy_menyu()
+    )
+
+@dp.callback_query(F.data == "rp:ochir")
+async def rp_ochir_royxat(cb: CallbackQuery):
+    replys = await db.get_all_replies()
+    if not replys: return await cb.answer("Reply yo'q")
+    qatorlar = [[(
+        "🗑 {} → {}".format(r["trigger"][:20], r["javob"][:20]),
+        "rd:{}".format(r["id"])
+    )] for r in replys]
+    qatorlar.append([("⬅️ Orqaga", "ax:reply")])
+    await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lganni tanlang:", ikb(qatorlar))
+
+@dp.callback_query(F.data.startswith("rd:"))
+async def rp_ochir(cb: CallbackQuery):
+    await db.delete_reply(int(cb.data.split(":")[1]))
+    await cb.answer("🗑 O'chirildi")
+    cb.data = "rp:ochir"
+    await rp_ochir_royxat(cb)
+
+@dp.callback_query(F.data == "reply:bosh")
+async def reply_boshlash(cb: CallbackQuery):
+    akkauntlar = await db.get_all_accounts()
+    aktiv = [a for a in akkauntlar if a["status"] in ("idle", "busy")]
+    if not aktiv: return await cb.answer("Aktiv akkunt yo'q")
+    boshlandi = 0
+    for akk in aktiv:
+        if akk["id"] not in reply_tasks or reply_tasks[akk["id"]].done():
+            reply_tasks[akk["id"]] = asyncio.create_task(_reply_tsikl(akk["id"]))
+            boshlandi += 1
+    await cb.answer("▶️ {} ta reply boshlandi".format(boshlandi))
+
+@dp.callback_query(F.data == "reply:toxt")
+async def reply_toxtatish(cb: CallbackQuery):
+    for t in reply_tasks.values(): t.cancel()
+    reply_tasks.clear()
+    await cb.answer("⏹ Reply to'xtatildi")
+
+
+# ── Tsikllar ──────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "avto:bosh")
 async def avto_boshlash(cb: CallbackQuery):
     akkauntlar = await db.get_all_accounts()
-    aktiv = [a for a in akkauntlar if a["status"] in ("idle","busy")]
+    aktiv = [a for a in akkauntlar if a["status"] in ("idle", "busy")]
     if not aktiv: return await cb.answer("Aktiv akkunt yo'q")
     boshlandi = 0
     for akk in aktiv:
         if akk["id"] not in auto_tasks or auto_tasks[akk["id"]].done():
             auto_tasks[akk["id"]] = asyncio.create_task(_avto_tsikl(akk["id"]))
             boshlandi += 1
-    await cb.answer(f"▶️ {boshlandi} ta boshlandi")
+    await cb.answer("▶️ {} ta boshlandi".format(boshlandi))
 
 @dp.callback_query(F.data == "avto:toxt")
 async def avto_toxtatish(cb: CallbackQuery):
@@ -914,7 +1137,7 @@ async def avto_toxtatish(cb: CallbackQuery):
     auto_tasks.clear()
     await cb.answer("⏹ To'xtatildi")
 
-async def _avto_tsikl(akk_id):
+async def _avto_tsikl(akk_id: int):
     oxirgi = None
     while True:
         try:
@@ -925,20 +1148,81 @@ async def _avto_tsikl(akk_id):
             tanlovlar = [s for s in sozlar if s != oxirgi] or sozlar
             soz       = random.choice(tanlovlar)
             oxirgi    = soz
+            soz_s     = await db.get_avto_sozlamalar()
             client    = await _get_client(akk_id)
-            if client and client.is_connected():
+            if not client or not client.is_connected():
+                await asyncio.sleep(30)
+                continue
+            if soz_s["guruh_aktiv"]:
                 for g in await db.get_monitored_groups():
                     try:
                         await client.send_message(g["group_id"], soz)
-                        await db.add_log(akk_id, "avto_xabar", f"{g['group_name']}: {soz}")
+                        await db.add_log(akk_id, "avto_guruh", "{}: {}".format(g["group_name"], soz[:30]))
                     except Exception as e:
-                        log.warning(f"avto_xabar akk={akk_id}: {e}")
-            await asyncio.sleep(random.randint(30, 120))
+                        log.warning("avto guruh akk={}: {}".format(akk_id, e))
+            if soz_s["lichka_aktiv"]:
+                try:
+                    dialogs = await client.get_dialogs(limit=20)
+                    for d in dialogs:
+                        if d.is_user and not d.entity.bot:
+                            try:
+                                await client.send_message(d.entity, soz)
+                                await db.add_log(akk_id, "avto_lichka", str(d.entity.id))
+                                await asyncio.sleep(random.randint(3, 8))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    log.warning("avto lichka akk={}: {}".format(akk_id, e))
+            mn = soz_s["min_interval"]
+            mx = soz_s["max_interval"]
+            await asyncio.sleep(random.randint(mn, mx))
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"avto_tsikl akk={akk_id}: {e}")
+            log.error("avto_tsikl akk={}: {}".format(akk_id, e))
             await asyncio.sleep(60)
+
+
+async def _reply_tsikl(akk_id: int):
+    client = await _get_client(akk_id)
+    if not client:
+        return
+
+    @client.on(events.NewMessage(incoming=True))
+    async def reply_handler(event):
+        try:
+            replys = await db.get_active_replies()
+            if not replys:
+                return
+            matn     = (event.message.text or "").lower()
+            is_guruh = event.is_group or event.is_channel
+            is_lch   = event.is_private
+            for r in replys:
+                if r["trigger"].lower() not in matn:
+                    continue
+                tur = r["tur"]
+                if tur == "guruh"  and not is_guruh: continue
+                if tur == "lichka" and not is_lch:   continue
+                try:
+                    await asyncio.sleep(random.randint(2, 8))
+                    await event.reply(r["javob"])
+                    await db.add_log(akk_id, "auto_reply",
+                                     "trigger={} chat={}".format(r["trigger"], event.chat_id))
+                    break
+                except Exception as e:
+                    log.warning("reply akk={}: {}".format(akk_id, e))
+        except Exception as e:
+            log.error("reply_handler akk={}: {}".format(akk_id, e))
+
+    try:
+        while True:
+            await asyncio.sleep(60)
+            if not client.is_connected():
+                try: await client.connect()
+                except Exception: pass
+    except asyncio.CancelledError:
+        try: client.remove_event_handler(reply_handler)
+        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1397,23 +1681,47 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
             call    = event.call
             chat_id = getattr(event, "chat_id", None)
             if chat_id is None: return
+            if not isinstance(call, GroupCall): return
+
             neg_chat_id = int(f"-100{chat_id}") if chat_id > 0 else chat_id
+            discarded   = getattr(call, "discarded", False)
+
+            # ── Video chat TUGADI — bizning akkuntlarni chiqaramiz ──
+            if discarded:
+                chiqarildi = 0
+                for akk_id, ses in list(vc_sessions.items()):
+                    if ses["chat_id"] in (chat_id, neg_chat_id, abs(chat_id)):
+                        ses["task"].cancel()
+                        chiqarildi += 1
+                if chiqarildi:
+                    log.info(f"VC tugadi chat={neg_chat_id}, {chiqarildi} akkunt chiqarildi")
+                    await adminlarga_xabar(
+                        f"📴 <b>Video chat tugadi</b>\n"
+                        f"<b>{chiqarildi}</b> ta akkunt chiqarildi."
+                    )
+                return
+
+            # Rejalashtirilgan call — e'tiborsiz
+            if getattr(call, "schedule_date", None): return
+
+            # ── Video chat BOSHLANDI — adminga xabar ──
             guruhlar = await db.get_monitored_groups()
             guruh = next((g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None)
-            if not guruh or not isinstance(call, GroupCall): return
-            if getattr(call, "discarded", False) or getattr(call, "schedule_date", None): return
+            if not guruh: return
+
             bosh = await db.get_accounts_by_status("idle")
             n    = len(bosh)
             await adminlarga_xabar(
                 f"🎥 <b>Video chat boshlandi!</b>\n📍 <b>{guruh['group_name']}</b>\n🟢 Bo'sh: {n} ta\n\nQo'shish?",
                 ikb([
-                    [("🎥 2 ta",f"vcal:2|{neg_chat_id}"),("🎥 4 ta",f"vcal:4|{neg_chat_id}")],
-                    [("🎥 Hammasi ({})".format(n),f"vcal:A|{neg_chat_id}")],
+                    [("🎥 5 ta",f"vcal:5|{neg_chat_id}"),("🎥 10 ta",f"vcal:10|{neg_chat_id}")],
+                    [("🎥 Hammasi ({} ta)".format(n),f"vcal:A|{neg_chat_id}")],
                     [("❌ Kerak emas","vcal:yoq")],
                 ])
             )
+            log.info(f"VC boshlandi: {guruh['group_name']} ({neg_chat_id})")
         except Exception as e:
-            log.error(f"vc_boshlandi xato: {e}")
+            log.error(f"vc_boshlandi xato: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
