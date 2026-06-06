@@ -1682,21 +1682,9 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
             admin_chiqardi = True
             log.info(f"vc_keep_alive CANCEL: {nom}")
             break
-
-        # Faqat ulanishni saqlash — boshqa hech narsa qilmaymiz
-        # GetFullChannelRequest ISHLATILMAYDI — u break qildiradi
-        try:
-            if not client.is_connected():
-                await client.connect()
-            # Eng oddiy ping
-            await client.get_me()
-            log.debug(f"vc alive: {nom}")
-        except asyncio.CancelledError:
-            admin_chiqardi = True
-            break
-        except Exception as e:
-            # HECH QANDAY xato chiqarish/break yo'q — davom etamiz
-            log.warning(f"vc ping {nom}: {e}")
+        # Ping YO'Q — hech qanday request yubormaymiz
+        # Faqat uxlash va CancelledError ni kutamiz
+        log.debug(f"vc alive: {nom}")
 
     # Faqat admin chiqargan bo'lsa Leave yuboramiz
     if admin_chiqardi:
