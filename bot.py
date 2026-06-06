@@ -553,57 +553,6 @@ async def cmd_reset_sessions(msg: Message, state: FSMContext):
         reply_markup=asosiy_menyu()
     )
 
-@dp.message(Command("add_proxies"))
-async def cmd_add_proxies(msg: Message):
-    """Proxy qo'shish: /add_proxies
-Har qatorda: IP:PORT:USER:PASS"""
-    if not await bosh_admin_mi(msg.from_user.id):
-        return await msg.answer("Faqat bosh admin.")
-    # Command dan keyingi matnni olish
-    matn = msg.text.replace("/add_proxies", "").strip()
-    if not matn:
-        return await msg.answer(
-            "Format:\n<code>IP:PORT:USER:PASS</code>\n\nMisol:\n"
-            "<code>104.239.107.47:5699:orqorvft:hz07pe7rtvl5</code>",
-            parse_mode="HTML"
-        )
-    proxies = []
-    for qator in matn.strip().splitlines():
-        qator = qator.strip()
-        if not qator: continue
-        parts = qator.split(":")
-        if len(parts) == 4:
-            try:
-                proxies.append({
-                    "host": parts[0], "port": int(parts[1]),
-                    "username": parts[2], "password": parts[3]
-                })
-            except Exception:
-                pass
-        elif len(parts) == 2:
-            try:
-                proxies.append({"host": parts[0], "port": int(parts[1])})
-            except Exception:
-                pass
-    if not proxies:
-        return await msg.answer("❌ Format xato.")
-    saqlandi = await db.add_proxies_bulk(proxies)
-    # Barcha akkuntlarga biriktirish
-    akkauntlar = await db.get_all_accounts()
-    birikmalar = 0
-    all_proxies = await db.get_active_proxies()
-    for i, akk in enumerate(akkauntlar):
-        if all_proxies:
-            p = all_proxies[i % len(all_proxies)]
-            await db.set_account_proxy(akk["id"], p["id"])
-            birikmalar += 1
-    await msg.answer(
-        "✅ <b>{}</b> ta proxy qo'shildi!\n"
-        "🔗 <b>{}</b> ta akkuntga biriktirildi.\n\n"
-        "Endi /reset_sessions → /login_all → /reload qiling.".format(saqlandi, birikmalar),
-        parse_mode="HTML", reply_markup=asosiy_menyu()
-    )
-
 @dp.message(Command("reset_sessions"))
 async def cmd_reset_sessions(msg: Message, state: FSMContext):
     """Barcha session_stringlarni DB dan ochiradi. Keyin /login_all qiling."""
