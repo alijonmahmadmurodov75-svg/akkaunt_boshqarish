@@ -156,23 +156,37 @@ async def _get_client(akk_id: int) -> TelegramClient | None:
         log.error(f"[get_client] akk={akk_id} ({akk.get('phone')}) session_string bo'sh!")
         return None
 
-    try:
-        c = TelegramClient(StringSession(ses), config.API_ID, config.API_HASH,
-                           connection_retries=3, retry_delay=2)
-        await c.connect()
-        if not await c.is_user_authorized():
-            log.error(f"[get_client] akk={akk_id} avtorizatsiya yo'q")
+    for urinish in range(3):
+        try:
+            c = TelegramClient(
+                StringSession(ses), config.API_ID, config.API_HASH,
+                connection_retries=5,
+                retry_delay=3,
+                auto_reconnect=True,
+            )
+            await c.connect()
+            if not await c.is_user_authorized():
+                log.error(f"[get_client] akk={akk_id} avtorizatsiya yo'q")
+                await db.update_account_status(akk_id, "failed")
+                return None
+            me = await c.get_me()
+            log.info(f"[get_client] akk={akk_id} ✅ @{me.username or me.id}")
+            clients[akk_id] = c
+            await _handlerlarni_qoshish(akk_id, c)
+            return c
+        except Exception as e:
+            err = str(e)
+            if "AUTH_KEY_DUPLICATED" in err:
+                log.warning(f"[get_client] akk={akk_id} AUTH_KEY_DUPLICATED — {urinish+1}/3 urinish, 10s kutilmoqda...")
+                try: await c.disconnect()
+                except: pass
+                await asyncio.sleep(10)
+                continue
+            log.error(f"[get_client] akk={akk_id} XATO: {e}")
             await db.update_account_status(akk_id, "failed")
             return None
-        me = await c.get_me()
-        log.info(f"[get_client] akk={akk_id} ✅ @{me.username or me.id}")
-        clients[akk_id] = c
-        await _handlerlarni_qoshish(akk_id, c)
-        return c
-    except Exception as e:
-        log.error(f"[get_client] akk={akk_id} XATO: {e}")
-        await db.update_account_status(akk_id, "failed")
-        return None
+    log.error(f"[get_client] akk={akk_id} 3 urinishdan keyin ham ulanmadi")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -417,6 +431,42 @@ async def _la_saqlash(msg, state, akk_id, client):
     await msg.answer("{} ({}) — saqlandi!".format(nom, men.phone))
     await asyncio.sleep(1)
     await _la_yuborish(msg, state)
+
+@dp.message(Command("reset_sessions"))
+async def cmd_reset_sessions(msg: Message, state: FSMContext):
+    """Barcha session_stringlarni DB dan o'chiradi. Keyin /login_all qiling."""
+    if not await bosh_admin_mi(msg.from_user.id):
+        return await msg.answer("Faqat bosh admin.")
+    pool = await db.get_pool()
+    # Barcha clientlarni uzish
+    for akk_id, c in list(clients.items()):
+        try: await c.disconnect()
+        except: pass
+    clients.clear()
+    # DB dan sessionlarni o'chirish
+    r = await pool.execute("UPDATE accounts SET session_string=NULL, status='idle'")
+    n = r.split()[-1] if r else "?"
+    await msg.answer(
+        "{} ta akkunt session o'chirildi.\n\nEndi /login_all bilan qayta login qiling.".format(n),
+        reply_markup=asosiy_menyu()
+    )
+
+@dp.message(Command("reset_sessions"))
+async def cmd_reset_sessions(msg: Message, state: FSMContext):
+    """Barcha session_stringlarni DB dan ochiradi. Keyin /login_all qiling."""
+    if not await bosh_admin_mi(msg.from_user.id):
+        return await msg.answer("Faqat bosh admin.")
+    pool = await db.get_pool()
+    for c in list(clients.values()):
+        try: await c.disconnect()
+        except: pass
+    clients.clear()
+    await pool.execute("UPDATE accounts SET session_string=NULL, status='idle'")
+    n = await pool.fetchval("SELECT COUNT(*) FROM accounts")
+    await msg.answer(
+        "{} ta akkunt session ochirildi.\n\nEndi /login_all bilan qayta login qiling.".format(n),
+        reply_markup=asosiy_menyu()
+    )
 
 @dp.message(Command("reload"))
 async def cmd_reload(msg: Message):
@@ -1682,9 +1732,36 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
             admin_chiqardi = True
             log.info(f"vc_keep_alive CANCEL: {nom}")
             break
-        # Ping YO'Q — hech qanday request yubormaymiz
-        # Faqat uxlash va CancelledError ni kutamiz
-        log.debug(f"vc alive: {nom}")
+
+        # Ulanish tekshiruvi — uzilsa qayta ulanib VC ga qayta kirish
+        if not client.is_connected():
+            log.warning(f"vc: {nom} uzilgan, qayta ulanmoqda...")
+            try:
+                await client.connect()
+                log.info(f"vc: {nom} qayta ulandi, VC ga qayta kirilmoqda...")
+                # VC ga qayta kirish
+                import random as _rnd, json as _json
+                try:
+                    entity    = await client.get_entity(chat_id)
+                    full_info = await client(GetFullChannelRequest(entity))
+                    full_chat = full_info.full_chat
+                    if hasattr(full_chat, "call") and full_chat.call:
+                        ssrc   = _rnd.randint(100_000_000, 999_999_999)
+                        params = DataJSON(data=_json.dumps({
+                            "ufrag": f"uf{ssrc}", "pwd": f"pw{ssrc}",
+                            "fingerprints": [{"hash":"sha-256","fingerprint":"AA"*32}],
+                            "ssrc": ssrc, "ssrc-groups": []
+                        }))
+                        me = await client.get_input_entity("me")
+                        await client(JoinGroupCallRequest(
+                            call=full_chat.call, join_as=me, params=params,
+                            muted=True, video_stopped=True, invite_hash=None
+                        ))
+                        log.info(f"vc: {nom} ✅ VC ga qayta kirdi")
+                except Exception as e2:
+                    log.warning(f"vc: {nom} qayta kirish xato: {e2}")
+            except Exception as e:
+                log.warning(f"vc: {nom} qayta ulanish xato: {e}")
 
     # Faqat admin chiqargan bo'lsa Leave yuboramiz
     if admin_chiqardi:
@@ -1874,19 +1951,35 @@ async def _barcha_clientlarni_yukla():
 
 async def _qayta_ulanish_tsikl():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         for akk in await db.get_all_accounts():
-            if akk["status"] in ("paused","failed"): continue
-            c = clients.get(akk["id"])
+            if akk["status"] in ("paused",): continue
+            akk_id = akk["id"]
+            c = clients.get(akk_id)
+
             if c is None:
                 if (akk.get("session_string") or "").strip():
-                    await _get_client(akk["id"])
+                    log.info(f"[qayta] akk={akk_id} yuklanmagan, urinilmoqda...")
+                    await _get_client(akk_id)
             elif not c.is_connected():
+                log.warning(f"[qayta] akk={akk_id} uzilgan, qayta ulanmoqda...")
                 try:
                     await c.connect()
+                    log.info(f"[qayta] akk={akk_id} ✅ qayta ulandi")
+                    # Agar VC da bo'lgan bo'lsa — qayta VC ga qaytarish
+                    if akk_id in vc_sessions:
+                        ses = vc_sessions[akk_id]
+                        log.info(f"[qayta] akk={akk_id} VC ga qaytarilmoqda...")
+                        ses["task"].cancel()
                 except Exception as e:
-                    log.error(f"[qayta] akk={akk['id']}: {e}")
-                    await db.update_account_status(akk["id"], "failed")
+                    err = str(e)
+                    if "AUTH_KEY_DUPLICATED" in err:
+                        log.warning(f"[qayta] akk={akk_id} AUTH_KEY_DUPLICATED — 15s keyin qayta urinish")
+                        del clients[akk_id]
+                        await asyncio.sleep(15)
+                        await _get_client(akk_id)
+                    else:
+                        log.error(f"[qayta] akk={akk_id}: {e}")
 
 async def ishga_tushish():
     await db.init_db()
