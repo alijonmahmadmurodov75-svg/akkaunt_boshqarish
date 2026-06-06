@@ -44,6 +44,7 @@ manual_picks: dict[int, list]       = defaultdict(list)
 vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
 # akk_id -> {task, chat_id, nom, call} — aktiv VC sessiyalar
 vc_sessions: dict[int, dict]         = {}
+_yuborilgan_vc_xabarlar: set          = set()  # deduplikatsiya uchun
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1814,17 +1815,21 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
             # Rejalashtirilgan call — e'tiborsiz
             if getattr(call, "schedule_date", None): return
 
-            # ── Video chat BOSHLANDI — adminga xabar ──
-            # Monitoring guruhlarida nom bor, boshqalarida chat_id ko'rsatamiz
+            # ── Video chat BOSHLANDI — faqat BITTA xabar ──
+            # Har akkunt event chiqaradi — deduplikatsiya kerak
+            xabar_kaliti = f"vc_xabar_{neg_chat_id}_{call.id}"
+            if xabar_kaliti in _yuborilgan_vc_xabarlar:
+                return  # Bu chat uchun xabar allaqachon yuborilgan
+            _yuborilgan_vc_xabarlar.add(xabar_kaliti)
+
+            # Eski kalitlarni tozalash (xotira uchun)
+            if len(_yuborilgan_vc_xabarlar) > 100:
+                _yuborilgan_vc_xabarlar.clear()
+
             guruhlar  = await db.get_monitored_groups()
             guruh     = next((g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None)
-
-            # Guruh nomini aniqlash — monitoring da bo'lmasa client orqali olamiz
-            guruh_nom = None
-            if guruh:
-                guruh_nom = guruh["group_name"]
-            else:
-                # Istalgan guruh/kanalda VC — nom olishga urinib ko'ramiz
+            guruh_nom = guruh["group_name"] if guruh else None
+            if not guruh_nom:
                 try:
                     entity    = await client.get_entity(neg_chat_id)
                     guruh_nom = getattr(entity, "title", None) or str(neg_chat_id)
@@ -1833,11 +1838,11 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
 
             bosh = await db.get_accounts_by_status("idle")
             n    = len(bosh)
+            eslatma = "" if guruh else "\n🟡 Monitoring da yo'q"
             await adminlarga_xabar(
                 f"🎥 <b>Video chat boshlandi!</b>\n"
-                f"📍 <b>{guruh_nom}</b>\n"
-                f"{'🟡 Monitoring da YO\'Q — qo\'lda link kering' if not guruh else ''}\n"
-                f"🟢 Bo\'sh: {n} ta\n\nQo\'shish?",
+                f"📍 <b>{guruh_nom}</b>{eslatma}\n"
+                f"🟢 Bo'sh: {n} ta\n\nQo'shish?",
                 ikb([
                     [("🎥 5 ta",f"vcal:5|{neg_chat_id}"),("🎥 10 ta",f"vcal:10|{neg_chat_id}")],
                     [("🎥 Hammasi ({} ta)".format(n),f"vcal:A|{neg_chat_id}")],
