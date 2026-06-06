@@ -322,7 +322,7 @@ async def _la_yuborish(msg, state):
         )
         await state.set_state(LoginAll.kod)
         await msg.answer(
-            "{}/{} — {}  kod yuborildi, kiriting:".format(idx+1, len(navbat), telefon)
+            "{}/{} — {} ({})  kod yuborildi, kiriting:".format(idx+1, len(navbat), akk.get("display_name") or "", telefon)
         )
     except FloodWaitError as e:
         try: await client.disconnect()
@@ -2002,3 +2002,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
