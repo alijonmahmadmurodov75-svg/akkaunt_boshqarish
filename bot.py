@@ -680,85 +680,103 @@ async def vc_chiqar_hammasi(cb: CallbackQuery):
     ]))
 
 
-async def _vc_bitta_qoshish(akk: dict, entity, call_ref) -> bool:
-    import json, random as rnd
-    client = clients.get(akk["id"]) or await _client_yuklash(akk)
-    nom    = akk["display_name"] or akk["phone"]
-    if not client:
-        log.warning(f"vc: {nom} — client yuklanmadi")
-        return False
-    try:
-        try:
-            await client(JoinChannelRequest(entity))
-        except Exception as e:
-            if "already" not in str(e).lower():
-                log.warning(f"vc JoinChannel {nom}: {e}")
-
-        ssrc   = rnd.randint(100000000, 999999999)
-        params = json.dumps({
-            "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
-            "fingerprints": [], "ssrc": ssrc
-        })
-        me = await client.get_input_entity("me")
-        await client(JoinGroupCallRequest(
-            call=call_ref, join_as=me,
-            muted=True, video_stopped=True,
-            params=DataJSON(data=params),
-            invite_hash=None
-        ))
-
-        task = asyncio.create_task(
-            _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
-        )
-        vc_sessions[akk["id"]] = {
-            "task":    task,
-            "call_ref": call_ref,
-            "chat_id": entity.id,
-            "nom":     nom,
-        }
-        vc_ping_tasks[akk["id"]][entity.id] = task
-        await db.update_account_status(akk["id"], "busy")
-        log.info(f"vc: {nom} ✅ kirdi")
-        return True
-    except Exception as e:
-        log.error(f"vc: {nom} kirish xato: {e}")
-        await db.update_account_status(akk["id"], "idle")
-        return False
-
 
 async def _vc_task(msg: Message, akkauntlar: list, link: str, username: str):
-    # Entity va call_ref ni birinchi akkunt orqali olamiz
-    birinchi_client = None
-    birinchi_entity = None
+    import json, random as rnd
+
+    # 1. Barcha akkuntlar uchun client'larni yuklaymiz
+    yuklangan = []
     for akk in akkauntlar:
-        c = clients.get(akk["id"]) or await _client_yuklash(akk)
-        if c:
-            birinchi_client = c
-            break
+        c = clients.get(akk["id"])
+        if not c:
+            c = await _client_yuklash(akk)
+        if c and c.is_connected():
+            yuklangan.append((akk, c))
+        elif c:
+            try:
+                await c.connect()
+                if await c.is_user_authorized():
+                    yuklangan.append((akk, c))
+            except Exception as e:
+                log.warning(f"vc reconnect xato {akk['phone']}: {e}")
 
-    if not birinchi_client:
-        return await msg.answer("❌ Hech qanday akkunt ulana olmadi.", reply_markup=asosiy_menyu())
+    if not yuklangan:
+        return await msg.answer(
+            "❌ Hech qanday akkunt ulana olmadi.\n"
+            "📊 Holat menyusidan akkuntlarni tekshiring.",
+            reply_markup=asosiy_menyu(), parse_mode="HTML"
+        )
 
-    try:
-        birinchi_entity = await birinchi_client.get_entity(username)
-        full_info = await birinchi_client(GetFullChannelRequest(birinchi_entity))
-        full_chat = full_info.full_chat
-        if not (hasattr(full_chat, "call") and full_chat.call):
-            return await msg.answer(
-                "❌ Bu kanalda hozir aktiv video chat yo'q.",
-                reply_markup=asosiy_menyu()
-            )
-        call_ref = full_chat.call
-    except Exception as e:
-        return await msg.answer(f"❌ Kanal topilmadi: {e}", reply_markup=asosiy_menyu())
+    # 2. Entity va call_ref birinchi muvaffaqiyatli client orqali
+    entity   = None
+    call_ref = None
+    for akk, c in yuklangan:
+        try:
+            entity    = await c.get_entity(username)
+            full_info = await c(GetFullChannelRequest(entity))
+            full_chat = full_info.full_chat
+            if hasattr(full_chat, "call") and full_chat.call:
+                call_ref = full_chat.call
+                break
+            else:
+                return await msg.answer(
+                    "❌ Bu kanalda hozir aktiv video chat yo'q.",
+                    reply_markup=asosiy_menyu()
+                )
+        except Exception as e:
+            log.warning(f"vc entity xato {akk['phone']}: {e}")
+            continue
 
+    if not entity or not call_ref:
+        return await msg.answer(
+            f"❌ Kanal topilmadi: <code>{username}</code>\n"
+            f"Username to'g'riligini tekshiring.",
+            reply_markup=asosiy_menyu(), parse_mode="HTML"
+        )
+
+    # 3. Barcha yuklangan akkuntlarni video chatga qo'shamiz
     ok = xato = 0
-    for akk in akkauntlar:
-        if await _vc_bitta_qoshish(akk, birinchi_entity, call_ref):
+    for akk, client in yuklangan:
+        nom = akk["display_name"] or akk["phone"]
+        try:
+            try:
+                await client(JoinChannelRequest(entity))
+            except Exception as e:
+                if "already" not in str(e).lower():
+                    log.warning(f"vc JoinChannel {nom}: {e}")
+
+            ssrc   = rnd.randint(100000000, 999999999)
+            params = json.dumps({
+                "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
+                "fingerprints": [], "ssrc": ssrc
+            })
+            me = await client.get_input_entity("me")
+            await client(JoinGroupCallRequest(
+                call=call_ref, join_as=me,
+                muted=True, video_stopped=True,
+                params=DataJSON(data=params),
+                invite_hash=None
+            ))
+
+            task = asyncio.create_task(
+                _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
+            )
+            vc_sessions[akk["id"]] = {
+                "task":     task,
+                "call_ref": call_ref,
+                "chat_id":  entity.id,
+                "nom":      nom,
+            }
+            vc_ping_tasks[akk["id"]][entity.id] = task
+            await db.update_account_status(akk["id"], "busy")
+            log.info(f"vc: {nom} ✅ kirdi")
             ok += 1
-        else:
+        except Exception as e:
+            log.error(f"vc: {nom} xato: {e}")
+            await db.update_account_status(akk["id"], "idle")
             xato += 1
-        if ok + xato < len(akkauntlar):
+
+        if ok + xato < len(yuklangan):
             await asyncio.sleep(random.randint(2, 5))
 
     await db.add_log(None, "vc_qoshildi", f"{username}: {ok} kirdi, {xato} xato")
@@ -774,36 +792,93 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str, username: str):
 
 
 async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
-    birinchi_client = None
+    import json, random as rnd
+
+    yuklangan = []
     for akk in akkauntlar:
-        c = clients.get(akk["id"]) or await _client_yuklash(akk)
-        if c:
-            birinchi_client = c
-            break
+        c = clients.get(akk["id"])
+        if not c:
+            c = await _client_yuklash(akk)
+        if c and c.is_connected():
+            yuklangan.append((akk, c))
+        elif c:
+            try:
+                await c.connect()
+                if await c.is_user_authorized():
+                    yuklangan.append((akk, c))
+            except Exception as e:
+                log.warning(f"vc reconnect xato {akk['phone']}: {e}")
 
-    if not birinchi_client:
-        return await msg.answer("❌ Hech qanday akkunt ulana olmadi.", reply_markup=asosiy_menyu())
+    if not yuklangan:
+        return await msg.answer(
+            "❌ Hech qanday akkunt ulana olmadi.",
+            reply_markup=asosiy_menyu()
+        )
 
-    try:
-        entity    = await birinchi_client.get_entity(chat_id)
-        full_info = await birinchi_client(GetFullChannelRequest(entity))
-        full_chat = full_info.full_chat
-        if not (hasattr(full_chat, "call") and full_chat.call):
-            return await msg.answer(
-                "❌ Bu kanalda hozir aktiv video chat yo'q.",
-                reply_markup=asosiy_menyu()
-            )
-        call_ref = full_chat.call
-    except Exception as e:
-        return await msg.answer(f"❌ Kanal topilmadi: {e}", reply_markup=asosiy_menyu())
+    entity   = None
+    call_ref = None
+    for akk, c in yuklangan:
+        try:
+            entity    = await c.get_entity(chat_id)
+            full_info = await c(GetFullChannelRequest(entity))
+            full_chat = full_info.full_chat
+            if hasattr(full_chat, "call") and full_chat.call:
+                call_ref = full_chat.call
+                break
+            else:
+                return await msg.answer(
+                    "❌ Bu kanalda hozir aktiv video chat yo'q.",
+                    reply_markup=asosiy_menyu()
+                )
+        except Exception as e:
+            log.warning(f"vc_by_id entity xato {akk['phone']}: {e}")
+            continue
+
+    if not entity or not call_ref:
+        return await msg.answer("❌ Kanal topilmadi.", reply_markup=asosiy_menyu())
 
     ok = xato = 0
-    for akk in akkauntlar:
-        if await _vc_bitta_qoshish(akk, entity, call_ref):
+    for akk, client in yuklangan:
+        nom = akk["display_name"] or akk["phone"]
+        try:
+            try:
+                await client(JoinChannelRequest(entity))
+            except Exception as e:
+                if "already" not in str(e).lower():
+                    log.warning(f"vc JoinChannel {nom}: {e}")
+
+            ssrc   = rnd.randint(100000000, 999999999)
+            params = json.dumps({
+                "ufrag": f"ufrag{ssrc}", "pwd": f"pwd{ssrc}",
+                "fingerprints": [], "ssrc": ssrc
+            })
+            me = await client.get_input_entity("me")
+            await client(JoinGroupCallRequest(
+                call=call_ref, join_as=me,
+                muted=True, video_stopped=True,
+                params=DataJSON(data=params),
+                invite_hash=None
+            ))
+
+            task = asyncio.create_task(
+                _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
+            )
+            vc_sessions[akk["id"]] = {
+                "task":     task,
+                "call_ref": call_ref,
+                "chat_id":  entity.id,
+                "nom":      nom,
+            }
+            vc_ping_tasks[akk["id"]][entity.id] = task
+            await db.update_account_status(akk["id"], "busy")
+            log.info(f"vc_by_id: {nom} ✅ kirdi")
             ok += 1
-        else:
+        except Exception as e:
+            log.error(f"vc_by_id: {nom} xato: {e}")
+            await db.update_account_status(akk["id"], "idle")
             xato += 1
-        if ok + xato < len(akkauntlar):
+
+        if ok + xato < len(yuklangan):
             await asyncio.sleep(random.randint(2, 5))
 
     try:
