@@ -28,6 +28,7 @@ from telethon.tl.types import UpdateGroupCall, GroupCall, DataJSON
 
 import config
 import database as db
+import proxy_fetcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ def asosiy_menyu():
         [("🗣 Avto xabar","m:avto"),("🎥 Video chat","m:vc")],
         [("👁 Monitoring","m:monitor"),("⚙️ Sozlamalar","m:sozlamalar")],
         [("🔴 Hammasini bo'shatish","m:boshat")],
+        [("🌐 Proxy","m:proxy")],
     ])
 
 async def xavfsiz_tahrir(cb, matn, markup=None):
@@ -158,12 +160,61 @@ async def _get_client(akk_id: int) -> TelegramClient | None:
 
     for urinish in range(3):
         try:
+            # Har akkunt o'ziga xos qurilma ko'rinadi
+            _devices = [
+                ("Samsung Galaxy S23", "Android 13"),
+                ("iPhone 14 Pro", "iOS 16.5"),
+                ("Xiaomi 13", "Android 13"),
+                ("OnePlus 11", "Android 13"),
+                ("Huawei P60", "Android 12"),
+                ("Samsung Galaxy A54", "Android 13"),
+                ("iPhone 13", "iOS 16.3"),
+                ("Redmi Note 12", "Android 12"),
+                ("Oppo Reno 10", "Android 13"),
+                ("Vivo V27", "Android 13"),
+                ("iPhone 12", "iOS 15.7"),
+                ("Samsung Galaxy S21", "Android 12"),
+                ("Poco X5 Pro", "Android 12"),
+                ("Realme GT 3", "Android 13"),
+                ("Nokia G60", "Android 12"),
+                ("Motorola Edge 40", "Android 13"),
+                ("Sony Xperia 1 V", "Android 13"),
+                ("Google Pixel 7", "Android 13"),
+                ("LG Velvet", "Android 11"),
+                ("Asus ROG Phone 7", "Android 13"),
+            ]
+            _dev = _devices[akk_id % len(_devices)]
+
+            # Proxy olish — akkuntga biriktirilgan yoki random
+            _proxy_tuple = None
+            try:
+                if akk.get("proxy_id"):
+                    _p = await db.get_proxy_by_id(akk["proxy_id"])
+                    if _p and _p["is_active"] and _p["fail_count"] < 5:
+                        _proxy_tuple = ("socks5", _p["host"], _p["port"])
+                if not _proxy_tuple:
+                    _rp = await db.get_random_proxy()
+                    if _rp:
+                        _proxy_tuple = ("socks5", _rp["host"], _rp["port"])
+                        # Akkuntga biriktirish
+                        await db.set_account_proxy(akk_id, _rp["id"])
+            except Exception:
+                _proxy_tuple = None
+
             c = TelegramClient(
                 StringSession(ses), config.API_ID, config.API_HASH,
                 connection_retries=5,
                 retry_delay=3,
                 auto_reconnect=True,
+                device_model=_dev[0],
+                system_version=_dev[1],
+                app_version="9.6.3",
+                lang_code="uz",
+                system_lang_code="uz-UZ",
+                proxy=_proxy_tuple,
             )
+            if _proxy_tuple:
+                log.info(f"[get_client] akk={akk_id} proxy: {_proxy_tuple[1]}:{_proxy_tuple[2]}")
             await c.connect()
             if not await c.is_user_authorized():
                 log.error(f"[get_client] akk={akk_id} avtorizatsiya yo'q")
@@ -557,6 +608,77 @@ async def boshat_execute(cb: CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Akkauntlar
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data == "m:proxy")
+async def menu_proxy(cb: CallbackQuery):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    stat = await db.get_proxy_count()
+    matn = (
+        "🌐 <b>Proxy boshqaruvi</b>\n\n"
+        "📊 Jami: <b>{}</b>\n"
+        "✅ Aktiv: <b>{}</b>\n"
+        "❌ Yomon: <b>{}</b>"
+    ).format(stat["jami"], stat["aktiv"], stat["yomon"])
+    await xavfsiz_tahrir(cb, matn, ikb([
+        [("🔄 Avtomatik yuklash", "px:auto"), ("📋 Ro'yxat", "px:royxat")],
+        [("🗑 Yomonlarni tozala", "px:tozala"), ("🔗 Akkuntlarga biriktir", "px:biriktir")],
+        [("⬅️ Orqaga", "m:bosh")],
+    ]))
+
+@dp.callback_query(F.data == "px:auto")
+async def proxy_auto(cb: CallbackQuery):
+    await xavfsiz_tahrir(cb, "⏳ Proxy yuklanmoqda... (30-60 soniya)")
+    try:
+        natija = await proxy_fetcher.proxies_yangilash(max_test=100)
+        stat   = await db.get_proxy_count()
+        await cb.message.edit_text(
+            "✅ <b>Proxy yangilandi!</b>\n\n"
+            "Tekshirildi: {} ta\n"
+            "Ishlaydigan: {} ta\n"
+            "Saqlandi: {} ta\n\n"
+            "DB da aktiv: <b>{}</b> ta".format(
+                natija["tekshirildi"], natija["ishlaydigan"],
+                natija["saqlandi"], stat["aktiv"]
+            ),
+            parse_mode="HTML",
+            reply_markup=ikb([[("⬅️ Orqaga", "m:proxy")]])
+        )
+    except Exception as e:
+        await cb.message.edit_text(f"❌ Xato: {e}", reply_markup=ikb([[("⬅️", "m:proxy")]]))
+
+@dp.callback_query(F.data == "px:biriktir")
+async def proxy_biriktir(cb: CallbackQuery):
+    """Barcha akkuntlarga random proxy biriktiradi."""
+    akkauntlar = await db.get_all_accounts()
+    n = 0
+    for akk in akkauntlar:
+        p = await db.get_random_proxy()
+        if p:
+            await db.set_account_proxy(akk["id"], p["id"])
+            n += 1
+    await cb.answer(f"✅ {n} ta akkuntga proxy biriktirildi")
+    await menu_proxy(cb)
+
+@dp.callback_query(F.data == "px:royxat")
+async def proxy_royxat(cb: CallbackQuery):
+    proxies = await db.get_all_proxies()
+    if not proxies:
+        return await xavfsiz_tahrir(cb, "Proxy yo'q.", ikb([[("⬅️", "m:proxy")]]))
+    qatorlar = []
+    for p in proxies[:15]:
+        belgi = "✅" if (p["is_active"] and p["fail_count"] < 5) else "❌"
+        qatorlar.append(f"{belgi} {p['host']}:{p['port']} xato:{p['fail_count']}")
+    matn = "📋 <b>Proxylar ({} ta):</b>\n\n".format(len(proxies)) + "\n".join(qatorlar)
+    if len(proxies) > 15:
+        matn += f"\n...va {len(proxies)-15} ta yana"
+    await xavfsiz_tahrir(cb, matn, ikb([[("⬅️ Orqaga", "m:proxy")]]))
+
+@dp.callback_query(F.data == "px:tozala")
+async def proxy_tozala(cb: CallbackQuery):
+    await db.deactivate_bad_proxies()
+    stat = await db.get_proxy_count()
+    await cb.answer("✅ Tozalandi")
+    await menu_proxy(cb)
 
 @dp.callback_query(F.data == "m:akkauntlar")
 async def menu_akkauntlar(cb: CallbackQuery):
@@ -1605,9 +1727,9 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
             log.error(f"vc_task akk={akk_id}: {type(e).__name__}: {e}")
             xato += 1
 
-        # Har akkunt orasida kichik kutish (spam bo'lmasin)
+        # Telegram shubhalanmasin — har akkunt orasida kutish
         if ok + xato < len(akkauntlar):
-            await asyncio.sleep(random.randint(2, 4))
+            await asyncio.sleep(random.randint(8, 15))
 
     natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
     if xato_sabablari:
@@ -1658,7 +1780,7 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
             xato += 1
 
         if ok + xato < len(akkauntlar):
-            await asyncio.sleep(random.randint(2, 4))
+            await asyncio.sleep(random.randint(8, 15))
 
     natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
     if xato_sabablari:
@@ -1714,6 +1836,45 @@ async def _vc_kochirish_task(msg: Message, band_list: list, yangi_link: str):
     await asyncio.sleep(1)
     await _vc_task(msg, tanlangan, yangi_link)
 
+async def _vc_qayta_kirish(akk_id: int, client: TelegramClient, chat_id: int, nom: str):
+    """Akkunt VC dan chiqib ketsa — qayta kiradi."""
+    await asyncio.sleep(2)  # Biroz kutish
+    for urinish in range(5):
+        try:
+            entity    = await client.get_entity(chat_id)
+            full_info = await client(GetFullChannelRequest(entity))
+            full_chat = full_info.full_chat
+            if not (hasattr(full_chat, "call") and full_chat.call):
+                log.info(f"vc qayta: {nom} — call tugagan, qayta kirish shart emas")
+                return
+            ssrc   = random.randint(100_000_000, 999_999_999)
+            params = DataJSON(data=json.dumps({
+                "ufrag": f"uf{ssrc}", "pwd": f"pw{ssrc}",
+                "fingerprints": [{"hash":"sha-256","fingerprint":"AA"*32}],
+                "ssrc": ssrc, "ssrc-groups": []
+            }))
+            me = await client.get_input_entity("me")
+            await client(JoinGroupCallRequest(
+                call=full_chat.call, join_as=me, params=params,
+                muted=True, video_stopped=True, invite_hash=None
+            ))
+            # keep_alive task ni yangilaymiz
+            if akk_id in vc_sessions:
+                vc_sessions[akk_id]["call"] = full_chat.call
+                old_task = vc_sessions[akk_id]["task"]
+                old_task.cancel()
+                new_task = asyncio.create_task(
+                    _vc_keep_alive(akk_id, client, full_chat.call, chat_id, nom)
+                )
+                vc_sessions[akk_id]["task"] = new_task
+                vc_ping_tasks[akk_id][chat_id] = new_task
+            log.info(f"vc qayta: {nom} ✅ qayta kirdi ({urinish+1}-urinish)")
+            return
+        except Exception as e:
+            log.warning(f"vc qayta: {nom} {urinish+1}-urinish xato: {e}")
+            await asyncio.sleep(3 * (urinish + 1))
+    log.error(f"vc qayta: {nom} 5 urinishdan keyin ham kira olmadi")
+
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
     """
     Akkuntni video chatda USHLAB TURADI.
@@ -1724,13 +1885,40 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
 
     while True:
         try:
-            # Cheksiz uxlaymiz — faqat CancelledError kelganda uyg'onamiz
-            await asyncio.sleep(86400)  # 24 soat — amalda cancel kutamiz
+            await asyncio.sleep(60)
         except asyncio.CancelledError:
             log.info(f"vc_keep_alive CANCEL: {nom}")
             break
         except Exception:
-            # Boshqa har qanday xato — davom etamiz, CHIQMAYMIZ
+            continue
+
+        # Har 60 sekundda: callda hali turganmizmi? Yo'q bo'lsa qayta kiramiz
+        try:
+            entity    = await client.get_entity(chat_id)
+            full_info = await client(GetFullChannelRequest(entity))
+            full_chat = full_info.full_chat
+            if not (hasattr(full_chat, "call") and full_chat.call):
+                log.info(f"vc: {nom} — call tugadi")
+                break
+            # Participants ni tekshiramiz — biz hali ichidamizmi?
+            me = await client.get_me()
+            from telethon.tl.functions.phone import GetGroupCallRequest
+            try:
+                gc_info = await client(GetGroupCallRequest(call=full_chat.call, limit=500))
+                user_ids = []
+                for p in gc_info.participants:
+                    if hasattr(p.peer, "user_id"):
+                        user_ids.append(p.peer.user_id)
+                if me.id not in user_ids:
+                    log.warning(f"vc: {nom} calldan chiqib ketgan — qayta kirilmoqda...")
+                    asyncio.create_task(_vc_qayta_kirish(akk_id, client, chat_id, nom))
+            except Exception:
+                pass  # Participants olishda xato — davom etamiz
+        except asyncio.CancelledError:
+            log.info(f"vc_keep_alive CANCEL: {nom}")
+            break
+        except Exception as e:
+            log.warning(f"vc check {nom}: {e} — davom etamiz")
             continue
 
     # Admin chiqardi — Leave yuboramiz
@@ -1817,6 +2005,36 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
                 if g["group_id"] == gid:
                     await _ogohlantirish_yuborish(gid, g["group_name"])
                     break
+
+    @client.on(events.Raw())
+    async def har_qanday_event(event):
+        """
+        UpdateGroupCallParticipants — VC dan chiqib ketganimizni aniqlash.
+        Agar biz chiqib ketgan bo'lsak — qayta kiramiz.
+        """
+        from telethon.tl.types import UpdateGroupCallParticipants
+        if not isinstance(event, UpdateGroupCallParticipants):
+            return
+        try:
+            # Chiqib ketgan participantlar
+            for p in event.participants:
+                if getattr(p, "left", False):
+                    # Bu bizning akkuntimizmi?
+                    me = await client.get_me()
+                    if p.peer and hasattr(p.peer, "user_id") and p.peer.user_id == me.id:
+                        # Biz chiqib ketdik — vc_sessions da bormi?
+                        chat_id = getattr(event, "call", None)
+                        call_id = getattr(chat_id, "id", None) if chat_id else None
+                        # akk_id ni topamiz
+                        for aid, ses in list(vc_sessions.items()):
+                            # Agar bu akkunt vc_sessions da bo'lsa — qayta kiramiz
+                            c2 = clients.get(aid)
+                            if c2 is client:
+                                log.warning(f"vc: {nom} chiqib ketdi — qayta kirilmoqda...")
+                                asyncio.create_task(_vc_qayta_kirish(aid, c2, ses["chat_id"], nom))
+                                break
+        except Exception as e:
+            pass
 
     @client.on(events.Raw(UpdateGroupCall))
     async def vc_boshlandi(event):
@@ -1948,11 +2166,33 @@ async def _qayta_ulanish_tsikl():
                     else:
                         log.error(f"[qayta] akk={akk_id}: {e}")
 
+async def _proxy_auto_tsikl():
+    """Har 3 soatda proxy yangilaydi — aktiv kam bo'lsa."""
+    await asyncio.sleep(120)  # 2 daqiqa keyin birinchi marta
+    while True:
+        try:
+            stat = await db.get_proxy_count()
+            if stat["aktiv"] < 10:
+                log.info("Proxy kam — avtomatik yangilanmoqda...")
+                natija = await proxy_fetcher.proxies_yangilash(max_test=100)
+                # Barcha akkuntlarga proxy biriktirish
+                akkauntlar = await db.get_all_accounts()
+                for akk in akkauntlar:
+                    if not akk.get("proxy_id"):
+                        p = await db.get_random_proxy()
+                        if p:
+                            await db.set_account_proxy(akk["id"], p["id"])
+                log.info(f"Auto proxy: {natija['ishlaydigan']} ta yangi")
+        except Exception as e:
+            log.error(f"proxy_auto_tsikl: {e}")
+        await asyncio.sleep(3 * 3600)
+
 async def ishga_tushish():
     await db.init_db()
     await db.add_admin(config.MAIN_ADMIN_ID, "main_admin", "main_admin")
     await _barcha_clientlarni_yukla()
     asyncio.create_task(_qayta_ulanish_tsikl())
+    asyncio.create_task(_proxy_auto_tsikl())
     log.info("Bot ishga tushdi ✅")
 
 async def toxtatish():
