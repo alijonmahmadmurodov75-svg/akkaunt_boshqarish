@@ -118,6 +118,7 @@ def asosiy_menyu():
         [("📊 Holat","m:holat"),("👥 Guruhga qo'sh","m:guruh")],
         [("🗣 Avto xabar","m:avto"),("🎥 Video chat","m:vc")],
         [("👁 Monitoring","m:monitor"),("⚙️ Sozlamalar","m:sozlamalar")],
+        [("🔴 Hammasini bo'shatish","m:boshat")],
     ])
 
 async def xavfsiz_tahrir(cb, matn, markup=None):
@@ -441,6 +442,65 @@ async def cmd_start(msg: Message, state: FSMContext):
 async def bosh_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await xavfsiz_tahrir(cb, "🤖 Boshqaruv paneli:", asosiy_menyu())
+
+@dp.callback_query(F.data == "m:boshat")
+async def boshat_confirm(cb: CallbackQuery):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    aktiv_vc  = len(vc_sessions)
+    aktiv_avto = sum(1 for t in auto_tasks.values() if not t.done())
+    aktiv_rep  = sum(1 for t in reply_tasks.values() if not t.done())
+    busy = await db.get_accounts_by_status("busy")
+    await xavfsiz_tahrir(cb,
+        f"🔴 <b>Hammasini bo'shatish</b>\n\n"
+        f"🎥 Video chatda: {aktiv_vc} ta\n"
+        f"🗣 Avto xabar: {aktiv_avto} ta\n"
+        f"🔄 Auto reply: {aktiv_rep} ta\n"
+        f"🔴 Band akkunt: {len(busy)} ta\n\n"
+        f"Tasdiqlaysizmi?",
+        ikb([
+            [("✅ Ha, hammasini to'xtat", "boshat:yes")],
+            [("❌ Yo'q", "m:bosh")],
+        ])
+    )
+
+@dp.callback_query(F.data == "boshat:yes")
+async def boshat_execute(cb: CallbackQuery):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    vc_n = avto_n = rep_n = db_n = 0
+
+    # 1. Video chatlardan chiqarish
+    for ses in list(vc_sessions.values()):
+        try: ses["task"].cancel()
+        except: pass
+        vc_n += 1
+
+    # 2. Avto xabarlarni to'xtatish
+    for t in list(auto_tasks.values()):
+        try: t.cancel()
+        except: pass
+        avto_n += 1
+    auto_tasks.clear()
+
+    # 3. Reply larni to'xtatish
+    for t in list(reply_tasks.values()):
+        try: t.cancel()
+        except: pass
+        rep_n += 1
+    reply_tasks.clear()
+
+    # 4. DB da busy akkuntlarni idle ga qaytarish
+    pool = await db.get_pool()
+    r = await pool.execute("UPDATE accounts SET status='idle' WHERE status='busy'")
+    db_n = int(r.split()[-1]) if r else 0
+
+    await xavfsiz_tahrir(cb,
+        f"✅ <b>Hammasi bo'shatildi!</b>\n\n"
+        f"🎥 Video chatdan chiqarildi: {vc_n} ta\n"
+        f"🗣 Avto xabar to'xtatildi: {avto_n} ta\n"
+        f"🔄 Reply to'xtatildi: {rep_n} ta\n"
+        f"🟢 Idle ga qaytarildi: {db_n} ta",
+        asosiy_menyu()
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1459,16 +1519,16 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
             continue
 
         try:
-            # 1. Guruhga qo'shilish (link orqali)
+            log.info(f"vc: {nom} — guruhga qo'shilmoqda...")
             entity = await guruhga_qoshil(client, link)
             if entity is None:
                 raise RuntimeError("Entity topilmadi")
+            log.info(f"vc: {nom} — guruhga qo'shildi, video chatga kirilmoqda...")
 
-            # 2. Video chatga kirish
             call     = await _vc_join_one(client, entity)
             group_id = entity.id
+            log.info(f"vc: {nom} — JoinGroupCallRequest muvaffaqiyatli, keep_alive boshlanmoqda...")
 
-            # 3. Keep-alive — admin chiq demasa chiqmaydi
             task = asyncio.create_task(
                 _vc_keep_alive(akk_id, client, call, group_id, nom)
             )
@@ -1480,7 +1540,7 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
 
             await db.update_account_status(akk_id, "busy")
             await db.add_log(akk_id, "vc_kirdi", link)
-            log.info(f"vc: {nom} ✅ kirdi")
+            log.info(f"vc: {nom} ✅ VIDEO CHATDA — keep_alive ishlayapti")
             ok += 1
 
         except FloodWaitError as e:
@@ -1841,4 +1901,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
