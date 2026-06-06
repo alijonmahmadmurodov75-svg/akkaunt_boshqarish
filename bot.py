@@ -735,15 +735,27 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str, username: str):
         )
 
     # 3. Barcha yuklangan akkuntlarni video chatga qo'shamiz
+    # Har bir akkunt o'z client'i orqali entity va call_ref oladi
     ok = xato = 0
     for akk, client in yuklangan:
         nom = akk["display_name"] or akk["phone"]
         try:
+            # Har bir client uchun alohida entity va call_ref olish
             try:
-                await client(JoinChannelRequest(entity))
+                akk_entity = await client.get_entity(username)
             except Exception as e:
-                if "already" not in str(e).lower():
-                    log.warning(f"vc JoinChannel {nom}: {e}")
+                log.warning(f"vc get_entity {nom}: {e} — birinchi entity ishlatiladi")
+                akk_entity = entity  # fallback
+
+            try:
+                akk_full  = await client(GetFullChannelRequest(akk_entity))
+                akk_call  = akk_full.full_chat.call
+                if not akk_call:
+                    log.warning(f"vc: {nom} — call topilmadi, birinchi call_ref ishlatiladi")
+                    akk_call = call_ref
+            except Exception as e:
+                log.warning(f"vc GetFull {nom}: {e} — birinchi call_ref ishlatiladi")
+                akk_call = call_ref
 
             ssrc   = rnd.randint(100000000, 999999999)
             params = json.dumps({
@@ -752,22 +764,22 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str, username: str):
             })
             me = await client.get_input_entity("me")
             await client(JoinGroupCallRequest(
-                call=call_ref, join_as=me,
+                call=akk_call, join_as=me,
                 muted=True, video_stopped=True,
                 params=DataJSON(data=params),
                 invite_hash=None
             ))
 
             task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
+                _vc_keep_alive(akk["id"], client, akk_call, akk_entity.id, nom)
             )
             vc_sessions[akk["id"]] = {
                 "task":     task,
-                "call_ref": call_ref,
-                "chat_id":  entity.id,
+                "call_ref": akk_call,
+                "chat_id":  akk_entity.id,
                 "nom":      nom,
             }
-            vc_ping_tasks[akk["id"]][entity.id] = task
+            vc_ping_tasks[akk["id"]][akk_entity.id] = task
             await db.update_account_status(akk["id"], "busy")
             log.info(f"vc: {nom} ✅ kirdi")
             ok += 1
@@ -841,11 +853,17 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
     for akk, client in yuklangan:
         nom = akk["display_name"] or akk["phone"]
         try:
+            # Har bir client uchun alohida entity va call_ref olish
             try:
-                await client(JoinChannelRequest(entity))
+                akk_entity = await client.get_entity(chat_id)
+                akk_full   = await client(GetFullChannelRequest(akk_entity))
+                akk_call   = akk_full.full_chat.call
+                if not akk_call:
+                    akk_call = call_ref
             except Exception as e:
-                if "already" not in str(e).lower():
-                    log.warning(f"vc JoinChannel {nom}: {e}")
+                log.warning(f"vc_by_id GetFull {nom}: {e} — birinchi call_ref ishlatiladi")
+                akk_entity = entity
+                akk_call   = call_ref
 
             ssrc   = rnd.randint(100000000, 999999999)
             params = json.dumps({
@@ -854,22 +872,22 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
             })
             me = await client.get_input_entity("me")
             await client(JoinGroupCallRequest(
-                call=call_ref, join_as=me,
+                call=akk_call, join_as=me,
                 muted=True, video_stopped=True,
                 params=DataJSON(data=params),
                 invite_hash=None
             ))
 
             task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, call_ref, entity.id, nom)
+                _vc_keep_alive(akk["id"], client, akk_call, akk_entity.id, nom)
             )
             vc_sessions[akk["id"]] = {
                 "task":     task,
-                "call_ref": call_ref,
-                "chat_id":  entity.id,
+                "call_ref": akk_call,
+                "chat_id":  akk_entity.id,
                 "nom":      nom,
             }
-            vc_ping_tasks[akk["id"]][entity.id] = task
+            vc_ping_tasks[akk["id"]][akk_entity.id] = task
             await db.update_account_status(akk["id"], "busy")
             log.info(f"vc_by_id: {nom} ✅ kirdi")
             ok += 1
@@ -895,39 +913,47 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call_ref, chat_id: int, nom: str):
     """
     Akkuntni video chatda USHLAB TURADI.
-    Faqat task.cancel() — admin "Chiqar" bosdi yoki video chat o'zi tugadi.
-    GetFullChannelRequest ishlatilmaydi — har qanday xatoda CHIQMAYDI.
+    FAQAT task.cancel() kelganda chiqadi — boshqa hech qanday holatda emas.
+    finally ishlatilmaydi — u har doim ishlaydi va akkuntni chiqarib yuboradi.
     """
     from telethon.tl.functions.phone import LeaveGroupCallRequest
 
     log.info(f"vc_keep_alive boshlandi: {nom}")
-    try:
-        while True:
-            await asyncio.sleep(30)
-            # Faqat ulanishni saqlash uchun oddiy ping
-            try:
-                if not client.is_connected():
-                    await client.connect()
-                await client.get_me()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Xato bo'lsa ham CHIQMAYMIZ — davom etamiz
-                log.warning(f"vc ping xato {nom}: {e}")
 
-    except asyncio.CancelledError:
-        log.info(f"vc_keep_alive to'xtatildi: {nom}")
-    finally:
+    admin_chiqardi = False
+
+    while True:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            admin_chiqardi = True
+            break
+
+        # Har 30 sekundda ulanishni tirik saqlash
+        try:
+            if not client.is_connected():
+                await client.connect()
+            await client.get_me()
+        except asyncio.CancelledError:
+            admin_chiqardi = True
+            break
+        except Exception as e:
+            # Xato bo'lsa ham DAVOM ETAMIZ — chiqmaymiz
+            log.warning(f"vc ping xato {nom}: {e}")
+
+    # Faqat admin chiqargan bo'lsa Leave yuboramiz
+    if admin_chiqardi:
         try:
             await client(LeaveGroupCallRequest(call=call_ref, source=0))
-            log.info(f"vc: {nom} chiqdi")
+            log.info(f"vc: {nom} chiqdi (admin buyrug'i)")
         except Exception as e:
             log.warning(f"vc Leave xato {nom}: {e}")
-        await db.update_account_status(akk_id, "idle")
-        vc_sessions.pop(akk_id, None)
-        if akk_id in vc_ping_tasks:
-            vc_ping_tasks[akk_id].pop(chat_id, None)
-        await db.add_log(akk_id, "vc_chiqdi", "admin yoki call tugadi")
+
+    await db.update_account_status(akk_id, "idle")
+    vc_sessions.pop(akk_id, None)
+    if akk_id in vc_ping_tasks:
+        vc_ping_tasks[akk_id].pop(chat_id, None)
+    await db.add_log(akk_id, "vc_chiqdi", "admin" if admin_chiqardi else "kutilmagan_chiqish")
 
 
 # ── Sozlamalar ────────────────────────────────────────────────────────────────
