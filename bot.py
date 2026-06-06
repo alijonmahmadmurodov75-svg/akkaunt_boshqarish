@@ -211,6 +211,20 @@ async def guruhga_qoshil(client: TelegramClient, link: str):
 # /start
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@dp.message(Command("reload"))
+async def cmd_reload(msg: Message):
+    """Restart qilmasdan barcha clientlarni qayta yuklaydi."""
+    if not await admin_mi(msg.from_user.id):
+        return await msg.answer("❌ Ruxsat yo'q.")
+    await msg.answer("🔄 Clientlar qayta yuklanmoqda...")
+    eski = len(clients)
+    await _barcha_clientlarni_yukla()
+    yangi = len(clients)
+    await msg.answer(
+        f"✅ Yuklash tugadi!\nOldin: {eski} ta\nHozir: {yangi} ta client",
+        reply_markup=asosiy_menyu()
+    )
+
 @dp.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
@@ -480,13 +494,21 @@ async def nom_qabul(msg: Message, state: FSMContext):
     malumot = await state.get_data()
     akk_id  = malumot["akk_id"]
     nom     = msg.text.strip() or malumot.get("avto_nom", malumot["telefon"])
+    # Avval session DB ga yozamiz
     await db.update_account_session(akk_id, malumot["sessiya"], malumot.get("username"))
     pool = await db.get_pool()
     await pool.execute("UPDATE accounts SET display_name=$1 WHERE id=$2", nom, akk_id)
+    log.info(f"[nom_qabul] akk={akk_id} session DB ga saqlandi, len={len(malumot.get("sessiya",""))}")
     await state.clear()
+    # Client allaqachon clients dict da — handlerlarni qo'shamiz
     client = clients.get(akk_id)
     if client:
         await _handlerlarni_qoshish(akk_id, client)
+        log.info(f"[nom_qabul] akk={akk_id} handler qo'shildi, client bor")
+    else:
+        # Fallback: DB dan qayta yukla
+        log.warning(f"[nom_qabul] akk={akk_id} clients da yo'q, DB dan yuklanmoqda...")
+        await _get_client(akk_id)
     await msg.answer(f"✅ Akkunt qo'shildi: <b>{nom}</b>", reply_markup=asosiy_menyu(), parse_mode="HTML")
 
 async def _sessiya_saqlash(msg, state, akk_id, client):
@@ -1116,15 +1138,29 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
 
 async def _barcha_clientlarni_yukla():
     akkauntlar = await db.get_all_accounts()
-    log.info(f"Jami {len(akkauntlar)} ta akkunt")
-    for akk in akkauntlar:
-        if akk["status"] in ("paused", "failed"): continue
-        if not (akk.get("session_string") or "").strip():
-            log.warning(f"[yukla] akk={akk['id']} ({akk['phone']}) session yo'q!")
-            continue
-        c = await _get_client(akk["id"])
-        log.info(f"[yukla] akk={akk['id']} ({'✅' if c else '❌'})")
-    log.info(f"Yuklandi: {len(clients)} / {len(akkauntlar)}")
+    log.info(f"Jami {len(akkauntlar)} ta akkunt topildi")
+
+    # Session bor akkuntlarni ajratib olamiz
+    yuklanadi = [
+        akk for akk in akkauntlar
+        if akk["status"] not in ("paused", "failed")
+        and (akk.get("session_string") or "").strip()
+    ]
+    yoq = len(akkauntlar) - len(yuklanadi)
+    log.info(f"Session bor: {len(yuklanadi)}, yo'q: {yoq}")
+
+    # Parallel yuklash (10 ta bir vaqtda)
+    sem = asyncio.Semaphore(10)
+    async def _yukla_bitta(akk):
+        async with sem:
+            c = await _get_client(akk["id"])
+            if c:
+                log.info(f"[yukla] ✅ akk={akk['id']} ({akk['phone']})")
+            else:
+                log.error(f"[yukla] ❌ akk={akk['id']} ({akk['phone']})")
+
+    await asyncio.gather(*[_yukla_bitta(akk) for akk in yuklanadi])
+    log.info(f"Yuklandi: {len(clients)} / {len(akkauntlar)} ta client")
 
 async def _qayta_ulanish_tsikl():
     while True:
@@ -1163,3 +1199,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
