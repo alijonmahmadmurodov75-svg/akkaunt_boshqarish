@@ -22,12 +22,9 @@ from telethon.errors import (
     ChatAdminRequiredError, ChannelPrivateError
 )
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest
-from telethon.tl.types import (
-    UpdateGroupCall, GroupCall, DataJSON,
-    InputGroupCall
-)
+from telethon.tl.types import UpdateGroupCall, GroupCall, DataJSON
 
 import config
 import database as db
@@ -38,14 +35,18 @@ log = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
+# Global: akk_id -> TelegramClient
 clients: dict[int, TelegramClient]  = {}
 group_activity: dict[int, list]     = defaultdict(list)
 auto_tasks: dict[int, asyncio.Task] = {}
 manual_picks: dict[int, list]       = defaultdict(list)
+# akk_id -> {chat_id -> asyncio.Task}
 vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
 
 
-# ── FSM ───────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# FSM holatlari
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class AkkuntQoshish(StatesGroup):
     telefon = State()
@@ -67,7 +68,9 @@ class VideoChat(StatesGroup):
     son  = State()
 
 
-# ── Yordamchi ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Yordamchi funksiyalar
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def ikb(rows: list[list[tuple]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -85,7 +88,10 @@ async def bosh_admin_mi(uid: int) -> bool:
 async def adminlarga_xabar(matn: str, markup=None):
     for a in await db.get_all_admins():
         try:
-            await bot.send_message(a["telegram_id"], matn, reply_markup=markup, parse_mode="HTML")
+            await bot.send_message(
+                a["telegram_id"], matn,
+                reply_markup=markup, parse_mode="HTML"
+            )
         except Exception:
             pass
 
@@ -97,10 +103,10 @@ def holat_nomi(h: str) -> str:
 
 def asosiy_menyu() -> InlineKeyboardMarkup:
     return ikb([
-        [("👤 Akkauntlar", "m:akkauntlar"), ("➕ Qo'shish",     "m:qoshish")],
-        [("📊 Holat",      "m:holat"),      ("👥 Guruhga qo'sh","m:guruh")],
-        [("🗣 Avto xabar", "m:avto"),       ("🎥 Video chat",   "m:vc")],
-        [("👁 Monitoring", "m:monitor"),    ("⚙️ Sozlamalar",   "m:sozlamalar")],
+        [("👤 Akkauntlar", "m:akkauntlar"), ("➕ Qo'shish",      "m:qoshish")],
+        [("📊 Holat",      "m:holat"),      ("👥 Guruhga qo'sh", "m:guruh")],
+        [("🗣 Avto xabar", "m:avto"),       ("🎥 Video chat",    "m:vc")],
+        [("👁 Monitoring", "m:monitor"),    ("⚙️ Sozlamalar",    "m:sozlamalar")],
     ])
 
 async def xavfsiz_tahrir(cb: CallbackQuery, matn: str, markup=None):
@@ -109,67 +115,140 @@ async def xavfsiz_tahrir(cb: CallbackQuery, matn: str, markup=None):
     except TelegramBadRequest:
         await cb.message.answer(matn, reply_markup=markup, parse_mode="HTML")
 
+def join_delay() -> int:
+    mn = getattr(config, "JOIN_DELAY_MIN", 8)
+    mx = getattr(config, "JOIN_DELAY_MAX", 20)
+    return random.randint(mn, mx)
 
-# ── Link tahlil ───────────────────────────────────────────────────────────────
 
-def link_parse(link: str):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Client olish — ENG MUHIM funksiya
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _get_client(akk_id: int) -> TelegramClient | None:
     """
-    Turli formatdagi linkni ajratadi.
+    clients dict dan client oladi.
+    Yo'q bo'lsa — database dan akkunt ma'lumotlarini yuklab, yangi client yaratadi.
+    Barcha xatolarni log qiladi.
+    """
+    # 1. Avval dict dan tekshir
+    c = clients.get(akk_id)
+    if c:
+        if not c.is_connected():
+            try:
+                await c.connect()
+                log.info(f"[get_client] akk={akk_id} qayta ulandi")
+            except Exception as e:
+                log.error(f"[get_client] akk={akk_id} qayta ulanish xato: {e}")
+                del clients[akk_id]
+                c = None
+        if c:
+            return c
+
+    # 2. Database dan akkunt ma'lumotlarini ol
+    akk = await db.get_account(akk_id)
+    if not akk:
+        log.error(f"[get_client] akk={akk_id} database da topilmadi")
+        return None
+
+    session_str = akk.get("session_string") or ""
+    if not session_str.strip():
+        log.error(f"[get_client] akk={akk_id} ({akk.get('phone')}) session_string bo'sh!")
+        return None
+
+    # 3. Yangi client yarat
+    try:
+        log.info(f"[get_client] akk={akk_id} ({akk.get('phone')}) yangi client yaratilmoqda...")
+        c = TelegramClient(
+            StringSession(session_str),
+            config.API_ID,
+            config.API_HASH,
+            connection_retries=3,
+            retry_delay=2,
+        )
+        await c.connect()
+
+        if not await c.is_user_authorized():
+            log.error(f"[get_client] akk={akk_id} avtorizatsiya yo'q — sessiya muddati o'tgan")
+            await db.update_account_status(akk_id, "failed")
+            await adminlarga_xabar(f"❌ Sessiya muddati o'tgan: {akk.get('phone')}")
+            return None
+
+        me = await c.get_me()
+        log.info(f"[get_client] akk={akk_id} ✅ ulandi: @{me.username or me.id}")
+        clients[akk_id] = c
+        await _handlerlarni_qoshish(akk_id, c)
+        return c
+
+    except Exception as e:
+        log.error(f"[get_client] akk={akk_id} ({akk.get('phone')}) XATO: {type(e).__name__}: {e}")
+        await db.update_account_status(akk_id, "failed")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Link tahlil
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def link_parse(link: str) -> dict | None:
+    """
+    Guruh/kanal linkini ajratadi.
     Qaytaradi: {"type": "invite"|"username", "value": str, "vc_hash": str}
     """
     link = link.strip()
-    # Invite link: t.me/+XXXX yoki t.me/joinchat/XXXX
+    # Invite: t.me/+XXX yoki t.me/joinchat/XXX
     inv = re.search(r"t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)", link)
     if inv:
-        vc_hash = ""
         hm = re.search(r"(?:videochat|voicechat|livestream)=?([^&\s]*)", link)
-        if hm:
-            vc_hash = hm.group(1)
-        return {"type": "invite", "value": inv.group(1), "vc_hash": vc_hash}
-
+        return {
+            "type": "invite",
+            "value": inv.group(1),
+            "vc_hash": hm.group(1) if hm else ""
+        }
     # Username: t.me/username yoki @username
     usr = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{3,})", link)
     if usr:
-        vc_hash = ""
         hm = re.search(r"(?:videochat|voicechat|livestream)=?([^&\s]*)", link)
-        if hm:
-            vc_hash = hm.group(1)
-        return {"type": "username", "value": usr.group(1), "vc_hash": vc_hash}
-
+        return {
+            "type": "username",
+            "value": usr.group(1),
+            "vc_hash": hm.group(1) if hm else ""
+        }
     return None
 
 
 async def guruhga_qoshil(client: TelegramClient, link: str):
     """
-    Guruh yoki kanalga qo'shiladi. Invite link va username ni ham qo'llab-quvvatlaydi.
-    Qaytaradi: entity yoki Exception
+    Guruh/kanalga qo'shiladi. Invite va username linkni qo'llab-quvvatlaydi.
+    Qaytaradi: entity
     """
     info = link_parse(link)
     if not info:
-        raise ValueError(f"Noto'g'ri link: {link}")
+        raise ValueError(f"Noto'g'ri link format: {link}")
 
     if info["type"] == "invite":
         try:
             result = await client(ImportChatInviteRequest(info["value"]))
-            return result.chats[0] if result.chats else None
+            chats = getattr(result, "chats", [])
+            return chats[0] if chats else None
         except UserAlreadyParticipantError:
-            # Allaqachon a'zo — entity olish
-            return await client.get_entity(link.split("?")[0].rstrip("/"))
-        except Exception:
-            raise
-    else:
-        try:
-            entity = await client.get_entity(info["value"])
+            # Allaqachon a'zo — entity ni qaytaramiz
             try:
-                await client(JoinChannelRequest(entity))
-            except UserAlreadyParticipantError:
-                pass
-            return entity
-        except Exception:
-            raise
+                return await client.get_entity(f"t.me/{info['value']}")
+            except Exception:
+                return None
+    else:
+        entity = await client.get_entity(info["value"])
+        try:
+            await client(JoinChannelRequest(entity))
+        except UserAlreadyParticipantError:
+            pass
+        return entity
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# /start
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
@@ -184,7 +263,9 @@ async def bosh_menu(cb: CallbackQuery, state: FSMContext):
     await xavfsiz_tahrir(cb, "🤖 Boshqaruv paneli:", asosiy_menyu())
 
 
-# ── Akkauntlar ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Akkauntlar
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:akkauntlar")
 async def menu_akkauntlar(cb: CallbackQuery):
@@ -203,20 +284,24 @@ async def menu_akkauntlar(cb: CallbackQuery):
 async def akk_detail(cb: CallbackQuery):
     akk = await db.get_account(int(cb.data.split(":")[1]))
     if not akk: return await cb.answer("Topilmadi")
+    # session bor-yo'qligini tekshir
+    has_session = bool(akk.get("session_string", "").strip())
     oxirgi = akk["last_active"].strftime("%d.%m %H:%M") if akk["last_active"] else "—"
     matn = (
         f"{holat_belgisi(akk['status'])} <b>{akk['display_name'] or akk['phone']}</b>\n"
         f"📱 <code>{akk['phone']}</code>\n"
         f"👤 @{akk['username'] or '—'}\n"
+        f"💾 Sessiya: {'✅' if has_session else '❌ YO\'Q'}\n"
         f"🔵 Holat: <b>{holat_nomi(akk['status'])}</b>\n"
         f"🕐 Oxirgi faollik: {oxirgi}"
     )
     aid = akk["id"]
-    await xavfsiz_tahrir(cb, matn, ikb([
+    kb_rows = [
         [("⏸ Pauza", f"hs:{aid}:paused"), ("▶️ Bo'shatish", f"hs:{aid}:idle")],
         [("🗑 O'chirish", f"ochir:{aid}")],
         [("⬅️ Orqaga", "m:akkauntlar")],
-    ]))
+    ]
+    await xavfsiz_tahrir(cb, matn, ikb(kb_rows))
 
 @dp.callback_query(F.data.startswith("hs:"))
 async def holat_ozgartir(cb: CallbackQuery):
@@ -239,7 +324,9 @@ async def akkunt_ochir(cb: CallbackQuery):
     await menu_akkauntlar(cb)
 
 
-# ── Holat ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Holat
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:holat")
 async def menu_holat(cb: CallbackQuery):
@@ -251,19 +338,29 @@ async def menu_holat(cb: CallbackQuery):
     band  = sum(1 for a in akkauntlar if a["status"] == "busy")
     pauza = sum(1 for a in akkauntlar if a["status"] == "paused")
     xato  = sum(1 for a in akkauntlar if a["status"] == "failed")
-    qatorlar = [
-        f"{holat_belgisi(a['status'])} <b>{a['display_name'] or a['phone']}</b> — {holat_nomi(a['status'])}"
-        for a in akkauntlar
-    ]
+    # clients dict bilan solishtir
+    ulangan = len(clients)
+    qatorlar = []
+    for a in akkauntlar:
+        has_client = "🔗" if a["id"] in clients else "⚠️"
+        has_session = "💾" if a.get("session_string") else "❌"
+        qatorlar.append(
+            f"{holat_belgisi(a['status'])} {has_client}{has_session} "
+            f"<b>{a['display_name'] or a['phone']}</b> — {holat_nomi(a['status'])}"
+        )
     matn = (
         f"📊 <b>Akkunt holati</b>\n"
-        f"🟢 Bo'sh: {bosh}  🔴 Band: {band}  ⏸ Pauza: {pauza}  ❌ Xato: {xato}\n\n"
+        f"🟢 Bo'sh: {bosh}  🔴 Band: {band}  ⏸ Pauza: {pauza}  ❌ Xato: {xato}\n"
+        f"🔗 Ulangan clientlar: {ulangan}\n\n"
         + "\n".join(qatorlar)
+        + "\n\n<i>🔗 = ulangan, ⚠️ = ulanmagan, 💾 = sessiya bor, ❌ = sessiya yo'q</i>"
     )
     await xavfsiz_tahrir(cb, matn, ikb([[("🔄 Yangilash", "m:holat"), ("⬅️ Orqaga", "m:bosh")]]))
 
 
-# ── Akkunt qo'shish ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Akkunt qo'shish
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:qoshish")
 async def qoshish_boshlash(cb: CallbackQuery, state: FSMContext):
@@ -283,7 +380,10 @@ async def telefon_qabul(msg: Message, state: FSMContext):
     try:
         natija = await client.send_code_request(telefon)
         clients[akk_id] = client
-        await state.update_data(telefon=telefon, akk_id=akk_id, hash=natija.phone_code_hash)
+        await state.update_data(
+            telefon=telefon, akk_id=akk_id,
+            hash=natija.phone_code_hash
+        )
         await state.set_state(AkkuntQoshish.kod)
         await msg.answer("📨 SMS kod yuborildi. Kodni kiriting:")
     except FloodWaitError as e:
@@ -314,7 +414,10 @@ async def kod_qabul(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("❌ Sessiya topilmadi.", reply_markup=asosiy_menyu())
     try:
-        await client.sign_in(malumot["telefon"], msg.text.strip(), phone_code_hash=malumot["hash"])
+        await client.sign_in(
+            malumot["telefon"], msg.text.strip(),
+            phone_code_hash=malumot["hash"]
+        )
         await _sessiya_saqlash(msg, state, akk_id, client)
     except SessionPasswordNeededError:
         await state.set_state(AkkuntQoshish.parol)
@@ -339,19 +442,30 @@ async def nom_qabul(msg: Message, state: FSMContext):
     malumot = await state.get_data()
     akk_id  = malumot["akk_id"]
     nom     = msg.text.strip() or malumot.get("avto_nom", malumot["telefon"])
+    # Sessiyani saqlash
     await db.update_account_session(akk_id, malumot["sessiya"], malumot.get("username"))
     pool = await db.get_pool()
-    await pool.execute("UPDATE accounts SET display_name=$1 WHERE id=$2", nom, akk_id)
+    await pool.execute(
+        "UPDATE accounts SET display_name=$1 WHERE id=$2", nom, akk_id
+    )
     await state.clear()
+    # Client handler qo'shish
     client = clients.get(akk_id)
     if client:
         await _handlerlarni_qoshish(akk_id, client)
-    await msg.answer(f"✅ Akkunt qo'shildi: <b>{nom}</b>", reply_markup=asosiy_menyu(), parse_mode="HTML")
+        log.info(f"[nom_qabul] akk={akk_id} ({nom}) handler qo'shildi")
+    else:
+        log.warning(f"[nom_qabul] akk={akk_id} clients dict da topilmadi!")
+    await msg.answer(
+        f"✅ Akkunt qo'shildi: <b>{nom}</b>",
+        reply_markup=asosiy_menyu(), parse_mode="HTML"
+    )
 
-async def _sessiya_saqlash(msg: Message, state: FSMContext, akk_id: int, client: TelegramClient):
+async def _sessiya_saqlash(msg, state, akk_id, client):
     men      = await client.get_me()
     ses      = client.session.save()
     avto_nom = men.first_name or men.username or str(men.id)
+    log.info(f"[sessiya_saqlash] akk={akk_id}, session len={len(ses)}, username=@{men.username}")
     await state.update_data(sessiya=ses, username=men.username, avto_nom=avto_nom)
     await state.set_state(AkkuntQoshish.nom)
     await msg.answer(
@@ -363,7 +477,9 @@ async def _sessiya_saqlash(msg: Message, state: FSMContext, akk_id: int, client:
     )
 
 
-# ── Guruhga qo'shish ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Guruhga qo'shish
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:guruh")
 async def guruh_boshlash(cb: CallbackQuery, state: FSMContext):
@@ -383,8 +499,7 @@ async def guruh_boshlash(cb: CallbackQuery, state: FSMContext):
 @dp.message(GuruhQoshilish.link)
 async def guruh_link_qabul(msg: Message, state: FSMContext):
     link = msg.text.strip()
-    info = link_parse(link)
-    if not info:
+    if not link_parse(link):
         return await msg.answer(
             "❌ Link noto'g'ri.\n\n"
             "To'g'ri formatlar:\n"
@@ -405,7 +520,7 @@ async def guruh_link_qabul(msg: Message, state: FSMContext):
     )
 
 @dp.callback_query(F.data.startswith("gq:"))
-async def guruh_qoshilish(cb: CallbackQuery):
+async def guruh_qoshilish_cb(cb: CallbackQuery):
     cnt, link = cb.data[3:].split("|", 1)
     bosh = await db.get_accounts_by_status("idle")
     if not bosh: return await cb.answer("Bo'sh akkunt yo'q")
@@ -414,50 +529,57 @@ async def guruh_qoshilish(cb: CallbackQuery):
     await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt guruhga qo'shilmoqda...")
     asyncio.create_task(_guruh_qoshish_task(cb.message, tanlangan, link))
 
-async def _guruh_qoshish_task(msg: Message, akkauntlar: list, link: str, amal: str = "guruh_qoshish"):
+
+async def _guruh_qoshish_task(
+    msg: Message,
+    akkauntlar: list,
+    link: str,
+    amal: str = "guruh_qoshish"
+):
     ok = xato = 0
     xato_sabablari = []
 
     for akk in akkauntlar:
         nom    = akk["display_name"] or akk["phone"]
-        client = clients.get(akk["id"]) or await _client_yuklash(akk)
+        akk_id = akk["id"]
+
+        # ── Client olish ──
+        client = await _get_client(akk_id)
         if not client:
             xato += 1
-            xato_sabablari.append(f"• {nom}: client yuklanmadi")
+            xato_sabablari.append(f"• {nom}: ulanmadi (session yo'q?)")
+            await asyncio.sleep(join_delay())
             continue
+
+        # ── Guruhga qo'shilish ──
         try:
             await guruhga_qoshil(client, link)
-            await db.update_account_status(akk["id"], "idle")
-            await db.add_log(akk["id"], amal, link)
+            await db.update_account_status(akk_id, "idle")
+            await db.add_log(akk_id, amal, link)
             ok += 1
-            log.info(f"guruh: {nom} ✅ qo'shildi")
+            log.info(f"guruh: {nom} ✅")
         except UserAlreadyParticipantError:
-            ok += 1  # Allaqachon a'zo — muvaffaqiyat deb hisoblaymiz
+            ok += 1
+            log.info(f"guruh: {nom} allaqachon a'zo")
         except FloodWaitError as e:
             wait = min(e.seconds, 60)
-            log.warning(f"FloodWait {e.seconds}s akk={akk['id']}, {wait}s kutilmoqda")
+            log.warning(f"FloodWait {e.seconds}s akk={akk_id}, {wait}s kutilmoqda")
             xato_sabablari.append(f"• {nom}: FloodWait {e.seconds}s")
             await asyncio.sleep(wait)
             xato += 1
         except InviteHashExpiredError:
-            xato_sabablari.append(f"• {nom}: Invite link muddati o'tgan")
+            xato_sabablari.append(f"• {nom}: Invite link eskirgan")
             xato += 1
         except (ChatAdminRequiredError, ChannelPrivateError) as e:
             xato_sabablari.append(f"• {nom}: {type(e).__name__}")
             xato += 1
         except Exception as e:
-            await db.update_account_status(akk["id"], "failed")
-            await db.add_log(akk["id"], amal, str(e)[:100], "error")
-            log.error(f"guruh_qoshish xato akk={akk['id']}: {e}")
+            await db.add_log(akk_id, amal, str(e)[:100], "error")
+            log.error(f"guruh xato akk={akk_id}: {type(e).__name__}: {e}")
             xato_sabablari.append(f"• {nom}: {str(e)[:50]}")
             xato += 1
 
-        # Har bir akkunt orasida tasodifiy kutish (FloodWait oldini olish)
-        delay = random.randint(
-            getattr(config, "JOIN_DELAY_MIN", 5),
-            getattr(config, "JOIN_DELAY_MAX", 15)
-        )
-        await asyncio.sleep(delay)
+        await asyncio.sleep(join_delay())
 
     natija = f"✅ Qo'shildi: {ok}  ❌ Xato: {xato}"
     if xato_sabablari:
@@ -468,7 +590,9 @@ async def _guruh_qoshish_task(msg: Message, akkauntlar: list, link: str, amal: s
         pass
 
 
-# ── Monitoring ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Monitoring
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:monitor")
 async def menu_monitor(cb: CallbackQuery):
@@ -478,8 +602,10 @@ async def menu_monitor(cb: CallbackQuery):
     bosh = sum(1 for a in akkauntlar if a["status"] == "idle")
     band = sum(1 for a in akkauntlar if a["status"] == "busy")
     matn = "👁 <b>Monitoring</b>\n\n<b>Kuzatilayotgan guruhlar:</b>\n"
-    matn += ("\n".join(f"• {g['group_name']} (<code>{g['group_id']}</code>)" for g in guruhlar)
-             if guruhlar else "Guruh yo'q.") + f"\n\n<b>Akkauntlar:</b> 🟢 Bo'sh: {bosh}  🔴 Band: {band}"
+    matn += ("\n".join(
+        f"• {g['group_name']} (<code>{g['group_id']}</code>)" for g in guruhlar
+    ) if guruhlar else "Guruh yo'q.")
+    matn += f"\n\n<b>Akkauntlar:</b> 🟢 Bo'sh: {bosh}  🔴 Band: {band}"
     await xavfsiz_tahrir(cb, matn, ikb([[("⬅️ Orqaga", "m:bosh")]]))
 
 def _faollik_tekshir(guruh_id: int) -> bool:
@@ -550,7 +676,9 @@ async def qolda_boshlash(cb: CallbackQuery):
     asyncio.create_task(_guruh_qoshish_task(cb.message, akkauntlar, link, "qolda_qoshish"))
 
 
-# ── Avto xabar ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Avto xabar
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:avto")
 async def menu_avto(cb: CallbackQuery):
@@ -622,7 +750,7 @@ async def _avto_tsikl(akk_id: int):
             tanlovlar = [s for s in sozlar if s != oxirgi] or sozlar
             soz       = random.choice(tanlovlar)
             oxirgi    = soz
-            client    = clients.get(akk_id)
+            client    = await _get_client(akk_id)
             if client and client.is_connected():
                 for g in await db.get_monitored_groups():
                     try:
@@ -638,7 +766,9 @@ async def _avto_tsikl(akk_id: int):
             await asyncio.sleep(60)
 
 
-# ── Video Chat ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Video Chat
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:vc")
 async def vc_menu(cb: CallbackQuery, state: FSMContext):
@@ -660,8 +790,7 @@ async def vc_menu(cb: CallbackQuery, state: FSMContext):
 @dp.message(VideoChat.link)
 async def vc_link_qabul(msg: Message, state: FSMContext):
     link = msg.text.strip()
-    info = link_parse(link)
-    if not info:
+    if not link_parse(link):
         return await msg.answer(
             "❌ Link to'g'ri emas.\n\n"
             "To'g'ri formatlar:\n"
@@ -671,7 +800,7 @@ async def vc_link_qabul(msg: Message, state: FSMContext):
         )
     bosh = await db.get_accounts_by_status("idle")
     n    = len(bosh)
-    await state.update_data(vc_link=link, vc_info=info)
+    await state.update_data(vc_link=link)
     await state.set_state(VideoChat.son)
     await msg.answer(
         f"✅ Link qabul qilindi\n"
@@ -697,7 +826,10 @@ async def vc_son_qabul(msg: Message, state: FSMContext):
         return await msg.answer("❌ Bo'sh akkunt yo'q.", reply_markup=asosiy_menyu())
     n         = min(int(matn), len(bosh))
     tanlangan = random.sample(bosh, n)
-    await msg.answer(f"⏳ {n} ta akkunt video chatga qo'shilmoqda...", reply_markup=asosiy_menyu())
+    await msg.answer(
+        f"⏳ {n} ta akkunt video chatga qo'shilmoqda...",
+        reply_markup=asosiy_menyu()
+    )
     asyncio.create_task(_vc_task(msg, tanlangan, malumot["vc_link"]))
 
 @dp.callback_query(F.data.startswith("vcn:"))
@@ -717,10 +849,8 @@ async def vc_son_tugma(cb: CallbackQuery, state: FSMContext):
     await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt video chatga qo'shilmoqda...")
     asyncio.create_task(_vc_task(cb.message, tanlangan, malumot["vc_link"]))
 
-
 @dp.callback_query(F.data.startswith("vcal:"))
 async def vcal_amal(cb: CallbackQuery):
-    """Video chat ogohlantirish — admin javob tugmalari."""
     qiymat = cb.data[5:]
     if qiymat == "yoq":
         return await xavfsiz_tahrir(cb, "✅ E'tiborsiz qoldirildi.")
@@ -734,10 +864,10 @@ async def vcal_amal(cb: CallbackQuery):
     asyncio.create_task(_vc_task_by_id(cb.message, tanlangan, chat_id))
 
 
-async def _vc_join_one(client: TelegramClient, entity) -> InputGroupCall:
+async def _vc_join_one(client: TelegramClient, entity):
     """
     Bir akkuntni video chatga qo'shadi.
-    Qaytaradi: InputGroupCall (keep-alive uchun)
+    Qaytaradi: (call_input, group_chat_id)
     """
     full_info = await client(GetFullChannelRequest(entity))
     full_chat = full_info.full_chat
@@ -745,15 +875,15 @@ async def _vc_join_one(client: TelegramClient, entity) -> InputGroupCall:
     if not (hasattr(full_chat, "call") and full_chat.call):
         raise RuntimeError("Aktiv video chat topilmadi")
 
-    call = full_chat.call  # InputGroupCall obyekti
+    call = full_chat.call  # InputGroupCall
 
     ssrc   = random.randint(100_000_000, 999_999_999)
     params = DataJSON(data=json.dumps({
-        "ufrag":        f"uf{ssrc}",
-        "pwd":          f"pw{ssrc}",
-        "fingerprints": [{"hash": "sha-256", "fingerprint": "00" * 32}],
-        "ssrc":         ssrc,
-        "ssrc-groups":  []
+        "ufrag":       f"uf{ssrc}",
+        "pwd":         f"pw{ssrc}",
+        "fingerprints": [{"hash": "sha-256", "fingerprint": "AA" * 32}],
+        "ssrc":        ssrc,
+        "ssrc-groups": []
     }))
 
     me = await client.get_input_entity("me")
@@ -769,17 +899,21 @@ async def _vc_join_one(client: TelegramClient, entity) -> InputGroupCall:
 
 
 async def _vc_task(msg: Message, akkauntlar: list, link: str):
-    """Video chatga username/invite link orqali qo'shilish."""
+    """Video chatga link orqali qo'shilish."""
     ok = xato = 0
     xato_sabablari = []
 
     for akk in akkauntlar:
         nom    = akk["display_name"] or akk["phone"]
-        client = clients.get(akk["id"]) or await _client_yuklash(akk)
+        akk_id = akk["id"]
+
+        client = await _get_client(akk_id)
         if not client:
             xato += 1
-            xato_sabablari.append(f"• {nom}: client yuklanmadi")
+            xato_sabablari.append(f"• {nom}: ulanmadi (session yo'q?)")
+            await asyncio.sleep(join_delay())
             continue
+
         try:
             # Guruhga qo'shilish
             entity = await guruhga_qoshil(client, link)
@@ -787,23 +921,22 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
                 raise RuntimeError("Entity topilmadi")
 
             # Video chatga qo'shilish
-            call       = await _vc_join_one(client, entity)
-            group_id   = entity.id
+            call     = await _vc_join_one(client, entity)
+            group_id = entity.id
 
-            # Keep-alive ishga tushirish
+            # Keep-alive task
             task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, call, group_id, nom)
+                _vc_keep_alive(akk_id, client, call, group_id, nom)
             )
-            vc_ping_tasks[akk["id"]][group_id] = task
+            vc_ping_tasks[akk_id][group_id] = task
 
-            await db.update_account_status(akk["id"], "busy")
-            await db.add_log(akk["id"], "vc_kirdi", link)
+            await db.update_account_status(akk_id, "busy")
+            await db.add_log(akk_id, "vc_kirdi", link)
             log.info(f"vc: {nom} ✅ video chatga kirdi")
             ok += 1
 
         except RuntimeError as e:
-            # Aktiv VC yo'q yoki entity topilmadi
-            await db.update_account_status(akk["id"], "idle")
+            await db.update_account_status(akk_id, "idle")
             xato_sabablari.append(f"• {nom}: {e}")
             xato += 1
         except FloodWaitError as e:
@@ -812,17 +945,13 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
             xato_sabablari.append(f"• {nom}: FloodWait {e.seconds}s")
             xato += 1
         except Exception as e:
-            await db.update_account_status(akk["id"], "idle")
-            await db.add_log(akk["id"], "vc_xato", str(e)[:100], "error")
+            await db.update_account_status(akk_id, "idle")
+            await db.add_log(akk_id, "vc_xato", str(e)[:100], "error")
             xato_sabablari.append(f"• {nom}: {str(e)[:60]}")
-            log.error(f"vc_task xato akk={akk['id']}: {e}")
+            log.error(f"vc_task xato akk={akk_id}: {type(e).__name__}: {e}")
             xato += 1
 
-        delay = random.randint(
-            getattr(config, "JOIN_DELAY_MIN", 5),
-            getattr(config, "JOIN_DELAY_MAX", 15)
-        )
-        await asyncio.sleep(delay)
+        await asyncio.sleep(join_delay())
 
     natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
     if xato_sabablari:
@@ -834,28 +963,32 @@ async def _vc_task(msg: Message, akkauntlar: list, link: str):
 
 
 async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
-    """Video chatga chat_id orqali qo'shilish (ogohlantirish tugmasidan)."""
+    """Video chatga chat_id orqali (ogohlantirish tugmasidan)."""
     ok = xato = 0
     xato_sabablari = []
 
     for akk in akkauntlar:
         nom    = akk["display_name"] or akk["phone"]
-        client = clients.get(akk["id"]) or await _client_yuklash(akk)
+        akk_id = akk["id"]
+
+        client = await _get_client(akk_id)
         if not client:
             xato += 1
-            xato_sabablari.append(f"• {nom}: client yuklanmadi")
+            xato_sabablari.append(f"• {nom}: ulanmadi")
+            await asyncio.sleep(join_delay())
             continue
+
         try:
             entity = await client.get_entity(chat_id)
             call   = await _vc_join_one(client, entity)
 
             task = asyncio.create_task(
-                _vc_keep_alive(akk["id"], client, call, chat_id, nom)
+                _vc_keep_alive(akk_id, client, call, chat_id, nom)
             )
-            vc_ping_tasks[akk["id"]][chat_id] = task
+            vc_ping_tasks[akk_id][chat_id] = task
 
-            await db.update_account_status(akk["id"], "busy")
-            await db.add_log(akk["id"], "vc_kirdi_auto", str(chat_id))
+            await db.update_account_status(akk_id, "busy")
+            await db.add_log(akk_id, "vc_kirdi_auto", str(chat_id))
             ok += 1
 
         except RuntimeError as e:
@@ -868,14 +1001,10 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
             xato += 1
         except Exception as e:
             xato_sabablari.append(f"• {nom}: {str(e)[:60]}")
-            log.error(f"vcal xato akk={akk['id']}: {e}")
+            log.error(f"vcal xato akk={akk_id}: {type(e).__name__}: {e}")
             xato += 1
 
-        delay = random.randint(
-            getattr(config, "JOIN_DELAY_MIN", 5),
-            getattr(config, "JOIN_DELAY_MAX", 15)
-        )
-        await asyncio.sleep(delay)
+        await asyncio.sleep(join_delay())
 
     natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
     if xato_sabablari:
@@ -886,12 +1015,12 @@ async def _vc_task_by_id(msg: Message, akkauntlar: list, chat_id: int):
         pass
 
 
-async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
-    """
-    Video chat tugaguncha akkuntni ushlab turadi.
-    Har 30 sekund da call holati tekshiriladi.
-    """
-    log.info(f"vc_keep_alive boshlandi: {nom} chat={chat_id}")
+async def _vc_keep_alive(
+    akk_id: int, client: TelegramClient,
+    call, chat_id: int, nom: str
+):
+    """Video chat tugaguncha akkuntni ushlab turadi."""
+    log.info(f"vc_keep_alive: {nom} chat={chat_id}")
     try:
         while True:
             await asyncio.sleep(30)
@@ -900,13 +1029,12 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
                 full_info = await client(GetFullChannelRequest(entity))
                 full_chat = full_info.full_chat
                 if not (hasattr(full_chat, "call") and full_chat.call):
-                    log.info(f"vc: {nom} — call tugadi, chiqmoqda")
+                    log.info(f"vc: {nom} — call tugadi")
                     break
             except Exception as e:
                 log.warning(f"vc_keep_alive tekshiruv xato {nom}: {e}")
-                continue
     except asyncio.CancelledError:
-        log.info(f"vc_keep_alive bekor qilindi: {nom}")
+        log.info(f"vc_keep_alive bekor: {nom}")
     finally:
         try:
             await client(LeaveGroupCallRequest(call=call, source=0))
@@ -918,7 +1046,9 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
             vc_ping_tasks[akk_id].pop(chat_id, None)
 
 
-# ── Sozlamalar ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sozlamalar
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:sozlamalar")
 async def menu_sozlamalar(cb: CallbackQuery):
@@ -941,23 +1071,32 @@ async def adm_saqlash(msg: Message, state: FSMContext):
         tid = int(msg.text.strip())
         await db.add_admin(tid, "", "admin")
         await state.clear()
-        await msg.answer(f"✅ Admin qo'shildi: <code>{tid}</code>",
-                         reply_markup=asosiy_menyu(), parse_mode="HTML")
+        await msg.answer(
+            f"✅ Admin qo'shildi: <code>{tid}</code>",
+            reply_markup=asosiy_menyu(), parse_mode="HTML"
+        )
     except ValueError:
         await msg.answer("❌ Noto'g'ri ID. Faqat raqam kiriting.")
 
 @dp.callback_query(F.data == "adm:royxat")
 async def adm_royxat(cb: CallbackQuery):
     adminlar = await db.get_all_admins()
-    qatorlar = [f"• <code>{a['telegram_id']}</code> {a['username'] or ''} ({a['role']})" for a in adminlar]
-    await xavfsiz_tahrir(cb, "👥 <b>Adminlar:</b>\n" + "\n".join(qatorlar),
-                         ikb([[("⬅️ Orqaga", "m:sozlamalar")]]))
+    qatorlar = [
+        f"• <code>{a['telegram_id']}</code> {a['username'] or ''} ({a['role']})"
+        for a in adminlar
+    ]
+    await xavfsiz_tahrir(
+        cb, "👥 <b>Adminlar:</b>\n" + "\n".join(qatorlar),
+        ikb([[("⬅️ Orqaga", "m:sozlamalar")]])
+    )
 
 @dp.callback_query(F.data == "adm:ochir")
 async def adm_ochir_royxat(cb: CallbackQuery):
     adminlar = await db.get_all_admins()
-    qatorlar = [[(f"🗑 {a['username'] or a['telegram_id']}", f"rmadm:{a['telegram_id']}")]
-                for a in adminlar if a["role"] != "main_admin"]
+    qatorlar = [
+        [(f"🗑 {a['username'] or a['telegram_id']}", f"rmadm:{a['telegram_id']}")]
+        for a in adminlar if a["role"] != "main_admin"
+    ]
     if not qatorlar: return await cb.answer("O'chirish uchun admin yo'q")
     qatorlar.append([("⬅️ Orqaga", "m:sozlamalar")])
     await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lgan adminni tanlang:", ikb(qatorlar))
@@ -970,25 +1109,9 @@ async def adm_ochir(cb: CallbackQuery):
     await adm_ochir_royxat(cb)
 
 
-# ── Telethon ──────────────────────────────────────────────────────────────────
-
-async def _client_yuklash(akk: dict) -> TelegramClient | None:
-    if not akk.get("session_string"):
-        return None
-    try:
-        c = TelegramClient(StringSession(akk["session_string"]), config.API_ID, config.API_HASH)
-        await c.connect()
-        if not await c.is_user_authorized():
-            await db.update_account_status(akk["id"], "failed")
-            await adminlarga_xabar(f"❌ Sessiya tugadi: {akk['phone']}")
-            return None
-        clients[akk["id"]] = c
-        await _handlerlarni_qoshish(akk["id"], c)
-        return c
-    except Exception as e:
-        log.error(f"client_yuklash {akk['phone']}: {e}")
-        await db.update_account_status(akk["id"], "failed")
-        return None
+# ═══════════════════════════════════════════════════════════════════════════════
+# Telethon handlers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
     @client.on(events.NewMessage())
@@ -1006,27 +1129,21 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
 
     @client.on(events.Raw(UpdateGroupCall))
     async def vc_boshlandi(event):
-        """Guruhda video/voice chat boshlansa xabar beradi."""
         try:
             call    = event.call
             chat_id = getattr(event, "chat_id", None)
             if chat_id is None:
                 return
-
             neg_chat_id = int(f"-100{chat_id}") if chat_id > 0 else chat_id
-
             guruhlar = await db.get_monitored_groups()
             guruh = next(
                 (g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)),
                 None
             )
-            if not guruh:
-                return
-            if not isinstance(call, GroupCall):
+            if not guruh or not isinstance(call, GroupCall):
                 return
             if getattr(call, "discarded", False) or getattr(call, "schedule_date", None):
                 return
-
             bosh = await db.get_accounts_by_status("idle")
             n    = len(bosh)
             matn = (
@@ -1041,35 +1158,63 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
                 [("🎥 Hammasi ({})".format(n), f"vcal:A|{neg_chat_id}")],
                 [("❌ Kerak emas", "vcal:yoq")],
             ]))
-            log.info(f"🎥 Video chat boshlandi: {guruh['group_name']} ({neg_chat_id})")
+            log.info(f"🎥 VC boshlandi: {guruh['group_name']} ({neg_chat_id})")
         except Exception as e:
             log.error(f"vc_boshlandi xato: {e}", exc_info=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bot ishga tushirish
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def _barcha_clientlarni_yukla():
+    """Barcha akkuntlarni yuklab, ulanadi."""
     akkauntlar = await db.get_all_accounts()
+    log.info(f"Jami {len(akkauntlar)} ta akkunt topildi")
+
     for akk in akkauntlar:
-        if akk["session_string"] and akk["status"] not in ("paused", "failed"):
-            await _client_yuklash(akk)
-    log.info(f"Yuklandi: {len(clients)} ta client")
+        if akk["status"] in ("paused", "failed"):
+            log.info(f"[yukla] akk={akk['id']} ({akk['phone']}) skip ({akk['status']})")
+            continue
+
+        session_str = akk.get("session_string") or ""
+        if not session_str.strip():
+            log.warning(f"[yukla] akk={akk['id']} ({akk['phone']}) — session_string YO'Q!")
+            continue
+
+        # _get_client orqali yukla (xatolarni o'zi handle qiladi)
+        c = await _get_client(akk["id"])
+        if c:
+            log.info(f"[yukla] akk={akk['id']} ({akk['phone']}) ✅ yuklandi")
+        else:
+            log.error(f"[yukla] akk={akk['id']} ({akk['phone']}) ❌ yuklanmadi")
+
+    log.info(f"Yuklandi: {len(clients)} / {len(akkauntlar)} ta client")
+
 
 async def _qayta_ulanish_tsikl():
+    """Har 60 sekund da ulanmagan clientlarni qayta ulanishga urinadi."""
     while True:
         await asyncio.sleep(60)
         for akk in await db.get_all_accounts():
             if akk["status"] in ("paused", "failed"):
                 continue
             c = clients.get(akk["id"])
-            if c and not c.is_connected():
+            if c is None:
+                # Yuklanmagan — qayta urinish
+                session_str = akk.get("session_string") or ""
+                if session_str.strip():
+                    log.info(f"[qayta] akk={akk['id']} yuklanmagan, urinilmoqda...")
+                    await _get_client(akk["id"])
+            elif not c.is_connected():
                 try:
                     await c.connect()
-                    log.info(f"Qayta ulandi: {akk['phone']}")
+                    log.info(f"[qayta] akk={akk['id']} qayta ulandi")
                 except Exception as e:
-                    log.error(f"Qayta ulanish xato {akk['phone']}: {e}")
+                    log.error(f"[qayta] akk={akk['id']} ulanish xato: {e}")
                     await db.update_account_status(akk["id"], "failed")
                     await adminlarga_xabar(f"❌ Ulanmadi: {akk['phone']}")
 
-
-# ── Ishga tushirish ───────────────────────────────────────────────────────────
 
 async def ishga_tushish():
     await db.init_db()
@@ -1088,7 +1233,10 @@ async def toxtatish():
 async def main():
     dp.startup.register(ishga_tushish)
     dp.shutdown.register(toxtatish)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
