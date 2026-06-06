@@ -228,6 +228,35 @@ async def guruhga_qoshil(client: TelegramClient, link: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+
+async def _akkauntlar_ikb():
+    akkauntlar = await db.get_all_accounts()
+    qatorlar = [[(
+        f"{holat_belgisi(a['status'])} {a['display_name'] or a['phone']} — {holat_nomi(a['status'])}",
+        f"akk:{a['id']}"
+    )] for a in akkauntlar]
+    qatorlar.append([("➕ Qo'shish","m:qoshish"),("⬅️ Orqaga","m:bosh")])
+    return ikb(qatorlar)
+
+async def _akk_detail_show(cb: CallbackQuery, akk: dict):
+    has_ses = bool((akk.get("session_string") or "").strip())
+    oxirgi  = akk["last_active"].strftime("%d.%m %H:%M") if akk["last_active"] else "—"
+    matn = (
+        f"{holat_belgisi(akk['status'])} <b>{akk['display_name'] or akk['phone']}</b>\n"
+        f"📱 <code>{akk['phone']}</code>\n"
+        f"👤 @{akk['username'] or '—'}\n"
+        f"💾 Sessiya: {'✅' if has_ses else '❌ YO\'Q'}\n"
+        f"🔵 Holat: <b>{holat_nomi(akk['status'])}</b>\n"
+        f"🕐 Oxirgi faollik: {oxirgi}"
+    )
+    aid = akk["id"]
+    kb = [[("⏸ Pauza",f"hs:{aid}:paused"),("▶️ Bo'shatish",f"hs:{aid}:idle")]]
+    if not has_ses:
+        kb.append([("🔑 Login qil",f"ses_login:{aid}")])
+    kb.append([("🗑 O'chirish",f"ochir:{aid}")])
+    kb.append([("⬅️ Orqaga","m:akkauntlar")])
+    await xavfsiz_tahrir(cb, matn, ikb(kb))
+
 @dp.message(Command("login_all"))
 async def cmd_login_all(msg: Message, state: FSMContext):
     if not await admin_mi(msg.from_user.id):
@@ -551,8 +580,10 @@ async def holat_ozgartir(cb: CallbackQuery):
     _, aid, holat = cb.data.split(":")
     await db.update_account_status(int(aid), holat)
     await cb.answer(f"✅ {holat_nomi(holat)}")
-    cb.data = f"akk:{aid}"
-    await akk_detail(cb)
+    akk2 = await db.get_account(int(aid))
+    if akk2:
+        await _akk_detail_show(cb, akk2)
+
 
 @dp.callback_query(F.data.startswith("ochir:"))
 async def akkunt_ochir(cb: CallbackQuery):
@@ -563,8 +594,8 @@ async def akkunt_ochir(cb: CallbackQuery):
         del clients[aid]
     await db.delete_account(aid)
     await cb.answer("🗑 O'chirildi")
-    cb.data = "m:akkauntlar"
-    await menu_akkauntlar(cb)
+    await cb.message.answer("📋 <b>Akkauntlar:</b>", reply_markup=await _akkauntlar_ikb())
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -943,8 +974,11 @@ async def soz_ochir_royxat(cb: CallbackQuery):
 async def soz_ochir(cb: CallbackQuery):
     await db.delete_word(int(cb.data.split(":")[1]))
     await cb.answer("🗑 O'chirildi")
-    cb.data = "ax:xabarlar"
-    await ax_xabarlar(cb)
+    sozlar3 = await db.get_all_words()
+    qatorlar5 = [[(s["word"][:30], f"sd:{s['id']}")]  for s in sozlar3]
+    qatorlar5.append([("⬅️ Orqaga", "m:avto")])
+    matn5 = "📝 <b>Xabarlar:</b>\n\n" + ("\n".join(f"{s['id']}. {s['word']}" for s in sozlar3) if sozlar3 else "Bo'sh")
+    await xavfsiz_tahrir(cb, matn5, ikb(qatorlar5))
 
 
 # ── Sozlamalar ─────────────────────────────────────────────────────────────────
@@ -1095,8 +1129,12 @@ async def rp_ochir_royxat(cb: CallbackQuery):
 async def rp_ochir(cb: CallbackQuery):
     await db.delete_reply(int(cb.data.split(":")[1]))
     await cb.answer("🗑 O'chirildi")
-    cb.data = "rp:ochir"
-    await rp_ochir_royxat(cb)
+    replys2 = await db.get_all_replies()
+    if not replys2: return
+    qatorlar3 = [[(f"🗑 {r['trigger'][:20]} → {r['javob'][:20]}", f"rd:{r['id']}")] for r in replys2]
+    qatorlar3.append([("⬅️ Orqaga", "ax:reply")])
+    await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lganni tanlang:", ikb(qatorlar3))
+
 
 @dp.callback_query(F.data == "reply:bosh")
 async def reply_boshlash(cb: CallbackQuery):
@@ -1584,39 +1622,20 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
             log.info(f"vc_keep_alive CANCEL: {nom}")
             break
 
-        # Ulanishni saqlash
+        # Faqat ulanishni saqlash — boshqa hech narsa qilmaymiz
+        # GetFullChannelRequest ISHLATILMAYDI — u break qildiradi
         try:
             if not client.is_connected():
                 await client.connect()
+            # Eng oddiy ping
+            await client.get_me()
+            log.debug(f"vc alive: {nom}")
         except asyncio.CancelledError:
             admin_chiqardi = True
             break
         except Exception as e:
-            log.warning(f"vc reconnect {nom}: {e}")
-            continue
-
-        # Akkunt hali callda ekanligini tekshirish
-        # Agar chiqib ketgan bo'lsa — qayta kiramiz
-        try:
-            entity    = await client.get_entity(chat_id)
-            full_info = await client(GetFullChannelRequest(entity))
-            full_chat = full_info.full_chat
-
-            if not (hasattr(full_chat, "call") and full_chat.call):
-                # Call tugagan — admin chiqarmagan, o'zimiz chiqdik
-                log.info(f"vc: {nom} — call tugadi")
-                break
-
-            # Call hali aktiv — participants tekshiramiz
-            # Oddiy ping yetarli, davom etamiz
-            log.debug(f"vc ping OK: {nom}")
-
-        except asyncio.CancelledError:
-            admin_chiqardi = True
-            break
-        except Exception as e:
-            # Xato bo'lsa ham CHIQMAYMIZ
-            log.warning(f"vc check {nom}: {e}")
+            # HECH QANDAY xato chiqarish/break yo'q — davom etamiz
+            log.warning(f"vc ping {nom}: {e}")
 
     # Faqat admin chiqargan bo'lsa Leave yuboramiz
     if admin_chiqardi:
@@ -1681,8 +1700,12 @@ async def adm_ochir_royxat(cb: CallbackQuery):
 async def adm_ochir(cb: CallbackQuery):
     await db.remove_admin(int(cb.data.split(":")[1]))
     await cb.answer("🗑 O'chirildi")
-    cb.data = "adm:ochir"
-    await adm_ochir_royxat(cb)
+    adminlar2 = await db.get_all_admins()
+    qatorlar4 = [[(f"🗑 {a['username'] or a['telegram_id']}", f"rmadm:{a['telegram_id']}")] for a in adminlar2 if a["role"] != "main_admin"]
+    if not qatorlar4: return
+    qatorlar4.append([("⬅️ Orqaga", "m:sozlamalar")])
+    await xavfsiz_tahrir(cb, "O'chirmoqchi bo'lgan adminni tanlang:", ikb(qatorlar4))
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1818,3 +1841,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
