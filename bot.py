@@ -21,8 +21,8 @@ from telethon.errors import (
     UserAlreadyParticipantError, InviteHashExpiredError,
     ChatAdminRequiredError, ChannelPrivateError
 )
-from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteChatUserRequest
 from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest, GetGroupCallRequest
 from telethon.tl.types import UpdateGroupCall, GroupCall, DataJSON
 
@@ -71,6 +71,9 @@ class ReplyQoshish(StatesGroup):
     javob   = State()
 
 class GuruhQoshilish(StatesGroup):
+    link = State()
+
+class GuruhChiqish(StatesGroup):
     link = State()
 
 class VideoChat(StatesGroup):
@@ -132,19 +135,12 @@ async def xavfsiz_tahrir(cb, matn, markup=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UMUMIY TO'XTATISH FUNKSIYASI — /stop va boshat:yes ikkalasi ishlatadi
+# UMUMIY TO'XTATISH FUNKSIYASI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _hammani_boshat() -> dict:
-    """
-    Barcha jarayonlarni to'xtatadi va natija statistikasini qaytaradi.
-    - VC session task larini cancel + finally blokini kutadi
-    - Auto xabar va reply task larini cancel
-    - DB da busy akkuntlarni idle ga qaytaradi
-    """
     vc_n = avto_n = rep_n = db_n = 0
 
-    # 1. Video chatlardan chiqarish — finally blokini kutib turamiz
     aktiv_sessiyalar = list(vc_sessions.values())
     if aktiv_sessiyalar:
         vc_n = len(aktiv_sessiyalar)
@@ -155,30 +151,23 @@ async def _hammani_boshat() -> dict:
                 t.cancel()
                 tasks_to_wait.append(t)
         if tasks_to_wait:
-            # finally bloki LeaveGroupCallRequest ni kafolat bilan yuboradi
             await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-        # vc_sessions _vc_keep_alive finally blokida o'zi tozalaydi,
-        # lekin qolgan bo'lsa qo'shimcha tozalaymiz
         vc_sessions.clear()
 
-    # 2. Avto xabarlarni to'xtatish
     for t in list(auto_tasks.values()):
         if not t.done():
             t.cancel()
             avto_n += 1
     auto_tasks.clear()
 
-    # 3. Reply larni to'xtatish
     for t in list(reply_tasks.values()):
         if not t.done():
             t.cancel()
             rep_n += 1
     reply_tasks.clear()
 
-    # 4. vc_ping_tasks tozalash
     vc_ping_tasks.clear()
 
-    # 5. DB da busy akkuntlarni idle ga qaytarish
     pool = await db.get_pool()
     r = await pool.execute("UPDATE accounts SET status='idle' WHERE status='busy'")
     db_n = int(r.split()[-1]) if r else 0
@@ -187,7 +176,7 @@ async def _hammani_boshat() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /stop — umumiy to'xtatish komandasi
+# /stop
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.message(Command("stop"))
@@ -349,7 +338,7 @@ async def _get_client(akk_id: int) -> TelegramClient | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Link parse va guruhga qo'shilish
+# Link parse, guruhga qo'shilish VA guruhdan chiqish
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def link_parse(link: str) -> dict | None:
@@ -391,6 +380,41 @@ async def guruhga_qoshil(client: TelegramClient, link: str):
         except UserAlreadyParticipantError:
             pass
         return entity
+
+
+async def guruhdan_chiq(client: TelegramClient, link: str) -> str:
+    """
+    Guruh/kanaldan chiqish.
+    Link: t.me/username, @username, yoki chat_id (str/int).
+    Qaytaradi: guruh nomi yoki id (log uchun).
+    """
+    info = link_parse(link) if not str(link).lstrip("-").isdigit() else None
+
+    try:
+        if info:
+            entity = await client.get_entity(
+                info["value"] if info["type"] == "username"
+                else f"https://t.me/+{info['value']}"
+            )
+        else:
+            entity = await client.get_entity(int(link))
+
+        nom = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
+
+        # Supergroup / channel — LeaveChannelRequest
+        from telethon.tl.types import Channel, Chat
+        if isinstance(entity, Channel):
+            await client(LeaveChannelRequest(entity))
+        elif isinstance(entity, Chat):
+            me = await client.get_me()
+            await client(DeleteChatUserRequest(chat_id=entity.id, user_id=me))
+        else:
+            await client(LeaveChannelRequest(entity))
+
+        return nom
+
+    except Exception as e:
+        raise e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -699,23 +723,15 @@ async def boshat_confirm(cb: CallbackQuery):
 @dp.callback_query(F.data == "boshat:yes")
 async def boshat_execute(cb: CallbackQuery):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
-
-    # Tugma bosilganda darhol javob beramiz (timeout bo'lmasin)
     await cb.answer("⏳ To'xtatilmoqda...")
-
-    # Xabarni "kutilmoqda" holatiga o'zgartiramiz
     try:
         await cb.message.edit_text(
-            "⏳ <b>Hammasi to'xtatilmoqda...</b>\n\n"
-            "Video chatlardan chiqilmoqda, iltimos kuting...",
+            "⏳ <b>Hammasi to'xtatilmoqda...</b>\n\nVideo chatlardan chiqilmoqda, iltimos kuting...",
             parse_mode="HTML"
         )
     except Exception:
         pass
-
-    # Umumiy to'xtatish funksiyasini chaqiramiz
     natija = await _hammani_boshat()
-
     try:
         await cb.message.edit_text(
             f"✅ <b>Hammasi bo'shatildi!</b>\n\n"
@@ -1090,15 +1106,29 @@ async def _sessiya_saqlash(msg, state, akk_id, client):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Guruhga qo'shish
+# Guruhga qo'shish VA guruhdan chiqish
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:guruh")
 async def guruh_boshlash(cb: CallbackQuery, state: FSMContext):
     if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
     bosh = await db.get_accounts_by_status("idle")
+    await xavfsiz_tahrir(cb,
+        f"👥 <b>Guruh boshqaruvi</b>\n\n"
+        f"🟢 Bo'sh akkuntlar: {len(bosh)} ta",
+        ikb([
+            [("➕ Guruhga qo'shish", "guruh:qoshish")],
+            [("🚪 Guruhdan chiqish", "guruh:chiqish")],
+            [("⬅️ Orqaga", "m:bosh")],
+        ])
+    )
+
+@dp.callback_query(F.data == "guruh:qoshish")
+async def guruh_qoshish_boshlash(cb: CallbackQuery, state: FSMContext):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    bosh = await db.get_accounts_by_status("idle")
     if not bosh:
-        return await xavfsiz_tahrir(cb, "❌ Bo'sh akkunt yo'q.", ikb([[("⬅️","m:bosh")]]))
+        return await xavfsiz_tahrir(cb, "❌ Bo'sh akkunt yo'q.", ikb([[("⬅️","m:guruh")]]))
     await xavfsiz_tahrir(cb,
         f"🔗 Guruh linkini yuboring:\n"
         f"<code>t.me/guruh</code> yoki <code>t.me/+InviteKod</code>\n\n"
@@ -1128,6 +1158,115 @@ async def guruh_qoshilish_cb(cb: CallbackQuery):
     tanlangan = random.sample(bosh, n)
     await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt guruhga qo'shilmoqda...")
     asyncio.create_task(_guruh_qoshish_task(cb.message, tanlangan, link))
+
+
+# ── Guruhdan chiqish ──────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "guruh:chiqish")
+async def guruh_chiqish_boshlash(cb: CallbackQuery, state: FSMContext):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+    akkauntlar = await db.get_all_accounts()
+    aktiv = [a for a in akkauntlar if a["status"] in ("idle", "busy")]
+    if not aktiv:
+        return await xavfsiz_tahrir(cb, "❌ Akkunt yo'q.", ikb([[("⬅️","m:guruh")]]))
+    await xavfsiz_tahrir(cb,
+        f"🚪 <b>Guruhdan chiqish</b>\n\n"
+        f"Guruh linkini yuboring:\n"
+        f"<code>t.me/guruh</code> yoki <code>@username</code>\n\n"
+        f"Akkuntlar: {len(aktiv)} ta"
+    )
+    await state.set_state(GuruhChiqish.link)
+
+@dp.message(GuruhChiqish.link)
+async def guruh_chiqish_link_qabul(msg: Message, state: FSMContext):
+    link = msg.text.strip()
+    # Oddiy raqam (chat_id) yoki link bo'lishi mumkin
+    if not link_parse(link) and not link.lstrip("-").isdigit():
+        return await msg.answer(
+            "❌ Link noto'g'ri.\nFormat: <code>t.me/guruh</code>, <code>@username</code> yoki chat_id",
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+    akkauntlar = await db.get_all_accounts()
+    aktiv = [a for a in akkauntlar if a["status"] in ("idle", "busy")]
+    n     = len(aktiv)
+
+    await msg.answer(
+        f"🚪 Nechta akkunt chiqsin?\n"
+        f"Akkuntlar: {n} ta",
+        reply_markup=ikb([
+            [("🚪 2 ta", f"gc:2|{link}"), ("🚪 5 ta", f"gc:5|{link}")],
+            [("🚪 10 ta", f"gc:10|{link}"), ("🚪 Hammasi ({})".format(n), f"gc:A|{link}")],
+            [("❌ Bekor", "m:guruh")],
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("gc:"))
+async def guruh_chiqish_cb(cb: CallbackQuery):
+    if not await admin_mi(cb.from_user.id): return await cb.answer("Ruxsat yo'q")
+
+    qiymat = cb.data[3:]
+    cnt, link = qiymat.split("|", 1)
+
+    akkauntlar = await db.get_all_accounts()
+    aktiv = [a for a in akkauntlar if a["status"] in ("idle", "busy")]
+    if not aktiv: return await cb.answer("Akkunt yo'q")
+
+    n         = len(aktiv) if cnt == "A" else min(int(cnt), len(aktiv))
+    tanlangan = random.sample(aktiv, n)
+
+    await xavfsiz_tahrir(cb, f"⏳ {n} ta akkunt guruhdan chiqarilmoqda...")
+    asyncio.create_task(_guruh_chiqish_task(cb.message, tanlangan, link))
+
+
+async def _guruh_chiqish_task(msg, akkauntlar: list, link: str):
+    """Akkuntlarni guruh/kanaldan chiqarish."""
+    ok = xato = 0
+    xato_sabablari = []
+
+    for akk in akkauntlar:
+        nom    = akk["display_name"] or akk["phone"]
+        akk_id = akk["id"]
+
+        client = await _get_client(akk_id)
+        if not client:
+            xato += 1
+            xato_sabablari.append(f"• {nom}: session yo'q")
+            await asyncio.sleep(2)
+            continue
+
+        try:
+            guruh_nom = await guruhdan_chiq(client, link)
+            await db.add_log(akk_id, "guruh_chiqdi", f"{guruh_nom}: {link[:50]}")
+            log.info(f"guruh_chiq: {nom} ✅ {guruh_nom} dan chiqdi")
+            ok += 1
+        except FloodWaitError as e:
+            kutish = min(e.seconds, 60)
+            await asyncio.sleep(kutish)
+            xato_sabablari.append(f"• {nom}: FloodWait {e.seconds}s")
+            xato += 1
+        except Exception as e:
+            err_txt = str(e)
+            # Akkunt guruhda bo'lmasa ham "ok" deb hisoblaymiz
+            if any(x in err_txt for x in ("not a member", "USER_NOT_PARTICIPANT", "CHANNEL_PRIVATE", "ChatNotFound")):
+                log.info(f"guruh_chiq: {nom} allaqachon guruhda yo'q ({err_txt})")
+                ok += 1
+            else:
+                xato_sabablari.append(f"• {nom}: {err_txt[:60]}")
+                log.error(f"guruh_chiq xato akk={akk_id}: {e}")
+                xato += 1
+
+        await asyncio.sleep(random.randint(2, 6))
+
+    natija = f"🚪 <b>Guruhdan chiqish natijasi</b>\n✅ Chiqdi: {ok}  ❌ Xato: {xato}"
+    if xato_sabablari:
+        natija += "\n\n<b>Tafsilotlar:</b>\n" + "\n".join(xato_sabablari[:5])
+    try:
+        await msg.answer(natija, reply_markup=asosiy_menyu(), parse_mode="HTML")
+    except Exception:
+        pass
+
 
 async def _guruh_qoshish_task(msg, akkauntlar, link, amal="guruh_qoshish"):
     ok = xato = 0
@@ -2042,7 +2181,6 @@ async def _vc_task_by_id(msg, akkauntlar: list, chat_id: int):
 
 
 async def _vc_kochirish_task(msg, band_list: list, yangi_link: str):
-    # 1. Hozirgi chatdan chiqarish
     tasks = [ses["task"] for ses in band_list if not ses["task"].done()]
     for ses in band_list:
         ses["task"].cancel()
@@ -2051,7 +2189,6 @@ async def _vc_kochirish_task(msg, band_list: list, yangi_link: str):
     vc_sessions.clear()
     await asyncio.sleep(2)
 
-    # 2. Yangi chatga kiritish
     band_nomlar = {s["nom"] for s in band_list}
     idle_akkauntlar = await db.get_accounts_by_status("idle")
     tanlangan = [
