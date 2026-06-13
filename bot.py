@@ -1,4 +1,3 @@
-
 import asyncio
 import random
 import logging
@@ -45,6 +44,9 @@ manual_picks: dict[int, list]       = defaultdict(list)
 vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
 vc_sessions: dict[int, dict]        = {}
 _yuborilgan_vc_xabarlar: set        = set()
+
+# Global stop event — /stop bosilganda HAMMA NARSA to'xtaydi
+_global_stop_event = asyncio.Event()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,79 +138,97 @@ async def xavfsiz_tahrir(cb, matn, markup=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UMUMIY TO'XTATISH FUNKSIYASI — TUZATILGAN
+# UMUMIY TO'XTATISH FUNKSIYASI — TO'LIQ QAYTA YOZILGAN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _vc_leave_safely(client: TelegramClient, akk_id: int, chat_id: int, nom: str):
+    """VC dan xavfsiz chiqish — exception larni yutib yuboradi"""
+    try:
+        entity    = await client.get_entity(chat_id)
+        full_info = await client(GetFullChannelRequest(entity))
+        full_chat = full_info.full_chat
+        if hasattr(full_chat, "call") and full_chat.call:
+            await client(LeaveGroupCallRequest(call=full_chat.call, source=0))
+            log.info(f"vc_leave: {nom} ✅ chiqdi")
+        else:
+            log.info(f"vc_leave: {nom} — call allaqachon tugagan")
+    except Exception as e:
+        log.warning(f"vc_leave {nom}: {e}")
+
+
 async def _hammani_boshat() -> dict:
+    """Hamma jarayonlarni to'xtatish: VC, avto xabar, reply, DB reset"""
     vc_n = avto_n = rep_n = db_n = 0
 
-    # --- 1. Video chat sessiyalarini to'g'ri yopish ---
-    aktiv_sessiyalar = list(vc_sessions.items())
-    if aktiv_sessiyalar:
-        vc_n = len(aktiv_sessiyalar)
-
-        # Avval Telegram serveriga LeaveGroupCallRequest yuboramiz
-        leave_tasks = []
-        for akk_id, ses in aktiv_sessiyalar:
-            client = clients.get(akk_id)
-            if client and client.is_connected():
-                chat_id = ses.get("chat_id")
-                nom = ses.get("nom", str(akk_id))
-                if chat_id:
-                    leave_tasks.append(
-                        _vc_leave_safely(client, akk_id, chat_id, nom)
-                    )
-
-        # Parallel chiqish (max 10 soniya kutamiz)
-        if leave_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*leave_tasks, return_exceptions=True),
-                    timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                log.warning("_hammani_boshat: VC chiqish timeout (10s)")
-
-        # Tasklarni bekor qilamiz
-        tasks_to_wait = []
-        for akk_id, ses in aktiv_sessiyalar:
-            t = ses.get("task")
-            if t and not t.done():
-                t.cancel()
-                tasks_to_wait.append(t)
-        if tasks_to_wait:
-            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-
-        # vc_sessions dagi har bir akkuntni DB da idle ga qaytaramiz
-        pool = await db.get_pool()
-        for akk_id, _ in aktiv_sessiyalar:
-            try:
-                await pool.execute(
-                    "UPDATE accounts SET status='idle' WHERE id=$1", akk_id
-                )
-            except Exception as e:
-                log.error(f"_hammani_boshat DB update akk={akk_id}: {e}")
-
-        vc_sessions.clear()
-
-    # --- 2. Avto xabar tasklarini to'xtatamiz ---
+    # --- 1. Barcha tasklarni DARHOL bekor qilamiz ---
+    # Auto tasks
     for t in list(auto_tasks.values()):
         if not t.done():
             t.cancel()
             avto_n += 1
     auto_tasks.clear()
 
-    # --- 3. Reply tasklarini to'xtatamiz ---
+    # Reply tasks
     for t in list(reply_tasks.values()):
         if not t.done():
             t.cancel()
             rep_n += 1
     reply_tasks.clear()
 
+    # VC ping tasks
+    for d in list(vc_ping_tasks.values()):
+        for t in list(d.values()):
+            if not t.done():
+                t.cancel()
     vc_ping_tasks.clear()
 
-    # --- 4. Qolgan barcha busy akkuntlarni idle ga qaytaramiz ---
+    # VC keep_alive tasklarni bekor qilamiz
+    vc_snapshot = list(vc_sessions.items())
+    vc_n = len(vc_snapshot)
+
+    for akk_id, ses in vc_snapshot:
+        t = ses.get("task")
+        if t and not t.done():
+            t.cancel()
+
+    # Tasklarning bekor bo'lishini kutamiz
+    if vc_snapshot:
+        all_tasks = [ses["task"] for _, ses in vc_snapshot if ses.get("task")]
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    # --- 2. VC dan Telegram serveriga LeaveGroupCallRequest yuboramiz ---
+    leave_tasks = []
+    for akk_id, ses in vc_snapshot:
+        client = clients.get(akk_id)
+        if client and client.is_connected():
+            chat_id = ses.get("chat_id")
+            nom = ses.get("nom", str(akk_id))
+            if chat_id:
+                leave_tasks.append(_vc_leave_safely(client, akk_id, chat_id, nom))
+
+    if leave_tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*leave_tasks, return_exceptions=True),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            log.warning("_hammani_boshat: VC chiqish timeout (15s)")
+
+    # --- 3. DB ni tozalaymiz ---
     pool = await db.get_pool()
+
+    # VC sessiyalarini idle ga
+    for akk_id, _ in vc_snapshot:
+        try:
+            await pool.execute("UPDATE accounts SET status='idle' WHERE id=$1", akk_id)
+        except Exception as e:
+            log.error(f"_hammani_boshat DB vc_session akk={akk_id}: {e}")
+
+    vc_sessions.clear()
+
+    # Qolgan busy larni ham idle ga
     r = await pool.execute("UPDATE accounts SET status='idle' WHERE status='busy'")
     db_n = int(r.split()[-1]) if r else 0
 
@@ -216,7 +236,7 @@ async def _hammani_boshat() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /stop — TUZATILGAN
+# /stop — TO'LIQ QAYTA YOZILGAN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.message(Command("stop"))
@@ -231,7 +251,6 @@ async def cmd_stop(msg: Message, state: FSMContext):
     aktiv_rep  = sum(1 for t in reply_tasks.values() if not t.done())
     busy       = await db.get_accounts_by_status("busy")
 
-    # vc_sessions va DB busy ni birlashtirish — "hamma bosh" muammosi shu yerda edi
     vc_akk_ids = set(vc_sessions.keys())
     busy_ids   = {a["id"] for a in busy}
     jami_band  = len(vc_akk_ids | busy_ids)
@@ -742,7 +761,7 @@ async def bosh_menu(cb: CallbackQuery, state: FSMContext):
     await xavfsiz_tahrir(cb, "🤖 Boshqaruv paneli:", asosiy_menyu())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HAMMASINI BO'SHATISH — TUZATILGAN
+# HAMMASINI BO'SHATISH
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:boshat")
@@ -905,7 +924,6 @@ async def akk_detail(cb: CallbackQuery):
     if not akk: return await cb.answer("Topilmadi")
     has_ses = bool((akk.get("session_string") or "").strip())
     oxirgi  = akk["last_active"].strftime("%d.%m %H:%M") if akk["last_active"] else "—"
-    # VC dagi holat
     in_vc = akk["id"] in vc_sessions
     holat_txt = "🎥 Video chatda" if in_vc else holat_nomi(akk["status"])
     matn = (
@@ -1031,7 +1049,6 @@ async def akkunt_ochir(cb: CallbackQuery):
         try: await clients[aid].disconnect()
         except: pass
         del clients[aid]
-    # VC dan ham chiqaramiz
     if aid in vc_sessions:
         ses = vc_sessions[aid]
         t = ses.get("task")
@@ -1044,7 +1061,7 @@ async def akkunt_ochir(cb: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Holat — TUZATILGAN
+# Holat
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:holat")
@@ -1054,10 +1071,8 @@ async def menu_holat(cb: CallbackQuery):
     if not akkauntlar:
         return await xavfsiz_tahrir(cb, "Akkunt yo'q.", ikb([[("⬅️","m:bosh")]]))
 
-    # vc_sessions dagi akkuntlarni aniqlaymiz
     vc_akk_ids = set(vc_sessions.keys())
 
-    # Haqiqiy holat hisoblash: VC da bo'lsa "busy" deb hisoblaymiz
     bosh  = sum(1 for a in akkauntlar if a["status"] == "idle" and a["id"] not in vc_akk_ids)
     band  = sum(1 for a in akkauntlar if a["status"] == "busy" or a["id"] in vc_akk_ids)
     pauza = sum(1 for a in akkauntlar if a["status"] == "paused")
@@ -1819,7 +1834,7 @@ async def _reply_tsikl(akk_id: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Video Chat
+# Video Chat — TO'LIQ QAYTA YOZILGAN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "m:vc")
@@ -1876,7 +1891,17 @@ async def vc_chiqar_hammasi(cb: CallbackQuery):
     except Exception:
         pass
 
-    # Avval LeaveGroupCallRequest yuboramiz
+    # Tasklarni bekor qilamiz
+    for ses in list(vc_sessions.values()):
+        t = ses.get("task")
+        if t and not t.done():
+            t.cancel()
+
+    all_tasks = [ses["task"] for ses in list(vc_sessions.values()) if ses.get("task")]
+    if all_tasks:
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    # VC dan chiqamiz
     leave_tasks = []
     for akk_id, ses in list(vc_sessions.items()):
         client = clients.get(akk_id)
@@ -1894,16 +1919,6 @@ async def vc_chiqar_hammasi(cb: CallbackQuery):
             )
         except asyncio.TimeoutError:
             log.warning("vc_chiqar_hammasi: timeout")
-
-    # Tasklarni bekor qilamiz
-    tasks = []
-    for ses in list(vc_sessions.values()):
-        t = ses.get("task")
-        if t and not t.done():
-            t.cancel()
-            tasks.append(t)
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     # DB ni yangilaymiz
     pool = await db.get_pool()
@@ -2024,13 +2039,25 @@ async def vcal_amal(cb: CallbackQuery):
     asyncio.create_task(_vc_task_by_id(cb.message, tanlangan, chat_id))
 
 
-# ── VC core funksiyalar ───────────────────────────────────────────────────────
+# ── VC core funksiyalar — TEZLASHTIRILGAN VA TUZATILGAN ──────────────────────
 
 async def _vc_join_one(client: TelegramClient, entity):
-    full_info = await client(GetFullChannelRequest(entity))
+    """
+    Guruhga a'zo bo'lingandan keyin chaqiriladi.
+    GetFullChannelRequest entity ni qabul qiladi — InputChannel yoki Channel.
+    """
+    # entity ni to'g'ri inputga aylantirish
+    try:
+        input_entity = await client.get_input_entity(entity)
+    except Exception:
+        input_entity = entity
+
+    full_info = await client(GetFullChannelRequest(input_entity))
     full_chat = full_info.full_chat
+
     if not (hasattr(full_chat, "call") and full_chat.call):
         raise RuntimeError("Aktiv video chat topilmadi")
+
     call = full_chat.call
     ssrc = random.randint(100_000_000, 999_999_999)
     params = DataJSON(data=json.dumps({
@@ -2046,21 +2073,11 @@ async def _vc_join_one(client: TelegramClient, entity):
     return call
 
 
-async def _vc_leave_safely(client: TelegramClient, akk_id: int, chat_id: int, nom: str):
-    try:
-        entity    = await client.get_entity(chat_id)
-        full_info = await client(GetFullChannelRequest(entity))
-        full_chat = full_info.full_chat
-        if hasattr(full_chat, "call") and full_chat.call:
-            await client(LeaveGroupCallRequest(call=full_chat.call, source=0))
-            log.info(f"vc_leave: {nom} ✅ chiqdi")
-        else:
-            log.info(f"vc_leave: {nom} — call allaqachon tugagan")
-    except Exception as e:
-        log.warning(f"vc_leave {nom}: {e}")
-
-
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
+    """
+    VC da ushlab turish — task cancel bo'lganda chiqadi.
+    finally blokida HECH QANDAY chiqish qilinmaydi (tashqaridan boshqariladi).
+    """
     log.info(f"vc_keep_alive BOSHLANDI: {nom} (chat={chat_id})")
 
     try:
@@ -2068,9 +2085,9 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
             await asyncio.sleep(60)
 
             try:
-                entity    = await client.get_entity(chat_id)
-                full_info = await client(GetFullChannelRequest(entity))
-                full_chat = full_info.full_chat
+                input_entity = await client.get_input_entity(chat_id)
+                full_info    = await client(GetFullChannelRequest(input_entity))
+                full_chat    = full_info.full_chat
 
                 if not (hasattr(full_chat, "call") and full_chat.call):
                     log.info(f"vc: {nom} — call tugadi (serverdan)")
@@ -2102,15 +2119,20 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
 
     except asyncio.CancelledError:
         log.info(f"vc_keep_alive CANCEL: {nom}")
+        raise  # muhim: re-raise qilamiz
 
     finally:
-        log.info(f"vc_keep_alive FINALLY: {nom} — chiqilmoqda...")
-        await _vc_leave_safely(client, akk_id, chat_id, nom)
-        await db.update_account_status(akk_id, "idle")
+        # Faqat natural tugashda (call tugaganda) DB va sessions yangilanadi
+        # CancelledError holatida _hammani_boshat o'zi boshqaradi
+        log.info(f"vc_keep_alive FINALLY: {nom}")
         vc_sessions.pop(akk_id, None)
         if akk_id in vc_ping_tasks:
             vc_ping_tasks[akk_id].pop(chat_id, None)
-        await db.add_log(akk_id, "vc_chiqdi", "admin buyrug'i yoki call tugadi")
+        try:
+            await db.update_account_status(akk_id, "idle")
+        except Exception:
+            pass
+        await db.add_log(akk_id, "vc_chiqdi", "call tugadi yoki bekor qilindi")
         log.info(f"vc_keep_alive TUGADI: {nom}")
 
 
@@ -2118,9 +2140,9 @@ async def _vc_qayta_kirish(akk_id: int, client: TelegramClient, chat_id: int, no
     await asyncio.sleep(2)
     for urinish in range(5):
         try:
-            entity    = await client.get_entity(chat_id)
-            full_info = await client(GetFullChannelRequest(entity))
-            full_chat = full_info.full_chat
+            input_entity = await client.get_input_entity(chat_id)
+            full_info    = await client(GetFullChannelRequest(input_entity))
+            full_chat    = full_info.full_chat
             if not (hasattr(full_chat, "call") and full_chat.call):
                 log.info(f"vc qayta: {nom} — call tugagan")
                 return
@@ -2157,132 +2179,175 @@ async def _vc_qayta_kirish(akk_id: int, client: TelegramClient, chat_id: int, no
     log.error(f"vc qayta: {nom} 5 urinishdan keyin ham kira olmadi")
 
 
-async def _vc_task(msg, akkauntlar: list, link: str):
-    ok = xato = 0
-    xato_sabablari = []
+async def _vc_bir_akkunt(akk: dict, link: str) -> tuple[bool, str]:
+    """
+    Bitta akkuntni VC ga parallel kiritish uchun.
+    Returns (muvaffaqiyat: bool, xato_sababi: str)
+    """
+    nom    = akk["display_name"] or akk["phone"]
+    akk_id = akk["id"]
 
-    for akk in akkauntlar:
-        nom    = akk["display_name"] or akk["phone"]
-        akk_id = akk["id"]
+    client = await _get_client(akk_id)
+    if not client:
+        return False, f"• {nom}: session yo'q"
 
-        client = await _get_client(akk_id)
-        if not client:
-            xato += 1
-            xato_sabablari.append(f"• {nom}: session yo'q")
-            await asyncio.sleep(2)
-            continue
-
-        try:
-            log.info(f"vc: {nom} — guruhga qo'shilmoqda...")
-            entity = await guruhga_qoshil(client, link)
-            if entity is None:
-                raise RuntimeError("Entity topilmadi")
-
-            log.info(f"vc: {nom} — video chatga kirilmoqda...")
-            call     = await _vc_join_one(client, entity)
-            group_id = entity.id
-
-            task = asyncio.create_task(
-                _vc_keep_alive(akk_id, client, call, group_id, nom)
-            )
-            vc_ping_tasks[akk_id][group_id] = task
-            vc_sessions[akk_id] = {
-                "task":    task,
-                "chat_id": group_id,
-                "call":    call,
-                "nom":     nom,
-                "akk_id":  akk_id,
-            }
-
-            await db.update_account_status(akk_id, "busy")
-            await db.add_log(akk_id, "vc_kirdi", link)
-            log.info(f"vc: {nom} ✅ VIDEO CHATDA")
-            ok += 1
-
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 60))
-            xato_sabablari.append(f"• {nom}: FloodWait {e.seconds}s")
-            xato += 1
-        except Exception as e:
-            await db.update_account_status(akk_id, "idle")
-            await db.add_log(akk_id, "vc_xato", str(e)[:100], "error")
-            xato_sabablari.append(f"• {nom}: {str(e)[:60]}")
-            log.error(f"vc_task akk={akk_id}: {type(e).__name__}: {e}")
-            xato += 1
-
-        if ok + xato < len(akkauntlar):
-            await asyncio.sleep(random.randint(8, 15))
-
-    natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
-    if xato_sabablari:
-        natija += "\n\n<b>Tafsilotlar:</b>\n" + "\n".join(xato_sabablari[:5])
     try:
-        await msg.answer(natija, reply_markup=asosiy_menyu(), parse_mode="HTML")
+        log.info(f"vc: {nom} — guruhga qo'shilmoqda...")
+        entity = await guruhga_qoshil(client, link)
+        if entity is None:
+            raise RuntimeError("Entity topilmadi")
+
+        # Entity ni tekshiramiz va to'g'ri formatga aylantirish
+        # Channel bo'lishi kerak (guruh yoki kanal)
+        from telethon.tl.types import Channel, Chat, InputChannel
+        if isinstance(entity, Chat):
+            # Oddiy guruh uchun VC qo'llab-quvvatlanmaydi
+            raise RuntimeError(f"Bu oddiy guruh (Chat), VC faqat Channel da ishlaydi")
+
+        log.info(f"vc: {nom} — video chatga kirilmoqda...")
+        call     = await _vc_join_one(client, entity)
+        group_id = entity.id
+
+        task = asyncio.create_task(
+            _vc_keep_alive(akk_id, client, call, group_id, nom)
+        )
+        vc_ping_tasks[akk_id][group_id] = task
+        vc_sessions[akk_id] = {
+            "task":    task,
+            "chat_id": group_id,
+            "call":    call,
+            "nom":     nom,
+            "akk_id":  akk_id,
+        }
+
+        await db.update_account_status(akk_id, "busy")
+        await db.add_log(akk_id, "vc_kirdi", link)
+        log.info(f"vc: {nom} ✅ VIDEO CHATDA")
+        return True, ""
+
+    except FloodWaitError as e:
+        await db.update_account_status(akk_id, "idle")
+        return False, f"• {nom}: FloodWait {e.seconds}s"
+    except Exception as e:
+        await db.update_account_status(akk_id, "idle")
+        await db.add_log(akk_id, "vc_xato", str(e)[:100], "error")
+        return False, f"• {nom}: {str(e)[:60]}"
+
+
+async def _vc_task(msg, akkauntlar: list, link: str):
+    """
+    PARALLEL VC kiritish — hamma akkuntlar bir vaqtda kirishga harakat qiladi.
+    Semaphore bilan 5 ta bir vaqtda (flood limitdan himoya).
+    """
+    sem = asyncio.Semaphore(5)  # bir vaqtda max 5 ta
+
+    async def _bir(akk):
+        async with sem:
+            return await _vc_bir_akkunt(akk, link)
+
+    # Hammasini parallel ishga tushuramiz
+    natijalar = await asyncio.gather(*[_bir(akk) for akk in akkauntlar], return_exceptions=True)
+
+    ok = 0
+    xato_sabablari = []
+    for r in natijalar:
+        if isinstance(r, Exception):
+            xato_sabablari.append(f"• exception: {str(r)[:50]}")
+        elif r[0]:
+            ok += 1
+        else:
+            xato_sabablari.append(r[1])
+
+    xato = len(akkauntlar) - ok
+    natija_matn = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
+    if xato_sabablari:
+        natija_matn += "\n\n<b>Tafsilotlar:</b>\n" + "\n".join(xato_sabablari[:5])
+    try:
+        await msg.answer(natija_matn, reply_markup=asosiy_menyu(), parse_mode="HTML")
     except Exception:
         pass
 
 
-async def _vc_task_by_id(msg, akkauntlar: list, chat_id: int):
-    ok = xato = 0
-    xato_sabablari = []
+async def _vc_bir_akkunt_by_id(akk: dict, chat_id: int) -> tuple[bool, str]:
+    """Bitta akkuntni chat_id orqali VC ga kiritish"""
+    nom    = akk["display_name"] or akk["phone"]
+    akk_id = akk["id"]
 
-    for akk in akkauntlar:
-        nom    = akk["display_name"] or akk["phone"]
-        akk_id = akk["id"]
+    client = await _get_client(akk_id)
+    if not client:
+        return False, f"• {nom}: session yo'q"
 
-        client = await _get_client(akk_id)
-        if not client:
-            xato += 1
-            xato_sabablari.append(f"• {nom}: session yo'q")
-            await asyncio.sleep(2)
-            continue
-
-        try:
-            entity = await client.get_entity(chat_id)
-            call   = await _vc_join_one(client, entity)
-            task   = asyncio.create_task(
-                _vc_keep_alive(akk_id, client, call, chat_id, nom)
-            )
-            vc_ping_tasks[akk_id][chat_id] = task
-            vc_sessions[akk_id] = {
-                "task":    task,
-                "chat_id": chat_id,
-                "call":    call,
-                "nom":     nom,
-                "akk_id":  akk_id,
-            }
-            await db.update_account_status(akk_id, "busy")
-            await db.add_log(akk_id, "vc_kirdi_auto", str(chat_id))
-            ok += 1
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 60))
-            xato_sabablari.append(f"• {nom}: FloodWait {e.seconds}s")
-            xato += 1
-        except Exception as e:
-            xato_sabablari.append(f"• {nom}: {str(e)[:60]}")
-            log.error(f"vcal akk={akk_id}: {e}")
-            xato += 1
-
-        if ok + xato < len(akkauntlar):
-            await asyncio.sleep(random.randint(8, 15))
-
-    natija = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
-    if xato_sabablari:
-        natija += "\n" + "\n".join(xato_sabablari[:5])
     try:
-        await msg.answer(natija, reply_markup=asosiy_menyu(), parse_mode="HTML")
+        input_entity = await client.get_input_entity(chat_id)
+        call   = await _vc_join_one(client, input_entity)
+        task   = asyncio.create_task(
+            _vc_keep_alive(akk_id, client, call, chat_id, nom)
+        )
+        vc_ping_tasks[akk_id][chat_id] = task
+        vc_sessions[akk_id] = {
+            "task":    task,
+            "chat_id": chat_id,
+            "call":    call,
+            "nom":     nom,
+            "akk_id":  akk_id,
+        }
+        await db.update_account_status(akk_id, "busy")
+        await db.add_log(akk_id, "vc_kirdi_auto", str(chat_id))
+        return True, ""
+    except FloodWaitError as e:
+        return False, f"• {nom}: FloodWait {e.seconds}s"
+    except Exception as e:
+        return False, f"• {nom}: {str(e)[:60]}"
+
+
+async def _vc_task_by_id(msg, akkauntlar: list, chat_id: int):
+    """PARALLEL VC kiritish chat_id orqali"""
+    sem = asyncio.Semaphore(5)
+
+    async def _bir(akk):
+        async with sem:
+            return await _vc_bir_akkunt_by_id(akk, chat_id)
+
+    natijalar = await asyncio.gather(*[_bir(akk) for akk in akkauntlar], return_exceptions=True)
+
+    ok = 0
+    xato_sabablari = []
+    for r in natijalar:
+        if isinstance(r, Exception):
+            xato_sabablari.append(f"• exception: {str(r)[:50]}")
+        elif r[0]:
+            ok += 1
+        else:
+            xato_sabablari.append(r[1])
+
+    xato = len(akkauntlar) - ok
+    natija_matn = f"🎥 <b>Video chat natija</b>\n✅ Kirdi: {ok}  ❌ Xato: {xato}"
+    if xato_sabablari:
+        natija_matn += "\n" + "\n".join(xato_sabablari[:5])
+    try:
+        await msg.answer(natija_matn, reply_markup=asosiy_menyu(), parse_mode="HTML")
     except Exception:
         pass
 
 
 async def _vc_kochirish_task(msg, band_list: list, yangi_link: str):
-    # Avval VC dan chiqaramiz
+    # Avval tasklarni bekor qilamiz
+    for ses in band_list:
+        t = ses.get("task")
+        if t and not t.done():
+            t.cancel()
+
+    all_tasks = [ses["task"] for ses in band_list if ses.get("task")]
+    if all_tasks:
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    # VC dan chiqamiz
     leave_tasks = []
     for ses in band_list:
-        akk_id = ses.get("akk_id")
+        akk_id  = ses.get("akk_id")
         chat_id = ses.get("chat_id")
-        nom = ses.get("nom", "")
-        client = clients.get(akk_id) if akk_id else None
+        nom     = ses.get("nom", "")
+        client  = clients.get(akk_id) if akk_id else None
         if client and client.is_connected() and chat_id:
             leave_tasks.append(_vc_leave_safely(client, akk_id, chat_id, nom))
 
@@ -2294,13 +2359,6 @@ async def _vc_kochirish_task(msg, band_list: list, yangi_link: str):
             )
         except asyncio.TimeoutError:
             pass
-
-    # Tasklarni bekor qilamiz
-    tasks = [ses["task"] for ses in band_list if not ses["task"].done()]
-    for ses in band_list:
-        ses["task"].cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     vc_sessions.clear()
     await asyncio.sleep(2)
@@ -2430,7 +2488,9 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
                 chiqarildi = 0
                 for aid, ses in list(vc_sessions.items()):
                     if ses["chat_id"] in (chat_id, neg_chat_id, abs(chat_id)):
-                        ses["task"].cancel()
+                        t = ses.get("task")
+                        if t and not t.done():
+                            t.cancel()
                         chiqarildi += 1
                 if chiqarildi:
                     log.info(f"VC tugadi chat={neg_chat_id}, {chiqarildi} akkunt chiqarildi")
@@ -2525,7 +2585,9 @@ async def _qayta_ulanish_tsikl():
                     if akk_id in vc_sessions:
                         ses = vc_sessions[akk_id]
                         log.info(f"[qayta] akk={akk_id} VC ga qaytarilmoqda...")
-                        ses["task"].cancel()
+                        t = ses.get("task")
+                        if t and not t.done():
+                            t.cancel()
                 except Exception as e:
                     err = str(e)
                     if "AUTH_KEY_DUPLICATED" in err:
