@@ -45,8 +45,21 @@ vc_ping_tasks: dict[int, dict]      = defaultdict(dict)
 vc_sessions: dict[int, dict]        = {}
 _yuborilgan_vc_xabarlar: set        = set()
 
-# Global stop event — /stop bosilganda HAMMA NARSA to'xtaydi
-_global_stop_event = asyncio.Event()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Global to'xtash bayrog'i va per-akkunt rejoin locklari
+# ═══════════════════════════════════════════════════════════════════════════════
+_vc_rejoin_locks: dict[int, asyncio.Lock] = {}
+
+def _get_rejoin_lock(akk_id: int) -> asyncio.Lock:
+    if akk_id not in _vc_rejoin_locks:
+        _vc_rejoin_locks[akk_id] = asyncio.Lock()
+    return _vc_rejoin_locks[akk_id]
+
+# Handler duplikatsiyasini oldini olish
+_handlers_qoshilgan: set = set()
+
+# Har event da get_me() chaqirmaslik — cache
+_client_user_ids: dict[int, int] = {}  # akk_id -> user_id
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -137,6 +150,33 @@ async def xavfsiz_tahrir(cb, matn, markup=None):
         await cb.message.answer(matn, reply_markup=markup, parse_mode="HTML")
 
 
+def _chat_id_normalize(chat_id: int) -> int:
+    """chat_id ni doim -100xxx formatiga keltirish.
+    Telegram channel/supergroup id lari:
+      - Telethon get_entity dan: -100xxxxxxxxxx
+      - Raw event chat_id dan: xxxxxxxxxx (musbat, -100 prefikssiz)
+    """
+    s = str(abs(chat_id))
+    # Agar allaqachon -100xxx formatida (masalan -1001234567)
+    if chat_id < 0 and s.startswith("100"):
+        return chat_id  # allaqachon to'g'ri
+    # Agar musbat va "100" bilan boshlanmasa — xom id
+    return int(f"-100{s}")
+
+
+def _chat_id_mos(a: int, b: int) -> bool:
+    """Ikki chat_id bir xil kanalga tegishli ekanligini tekshirish.
+    Misol: -1001234567 va 1234567 bir xil.
+    """
+    def _raw(x: int) -> str:
+        s = str(abs(x))
+        if s.startswith("100") and len(s) > 10:
+            return s[3:]  # "100" prefiksni olib tashlash
+        return s
+
+    return _raw(a) == _raw(b) or abs(a) == abs(b)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # UMUMIY TO'XTATISH FUNKSIYASI — TO'LIQ QAYTA YOZILGAN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -144,9 +184,9 @@ async def xavfsiz_tahrir(cb, matn, markup=None):
 async def _vc_leave_safely(client: TelegramClient, akk_id: int, chat_id: int, nom: str):
     """VC dan xavfsiz chiqish — exception larni yutib yuboradi"""
     try:
-        entity    = await client.get_entity(chat_id)
-        full_info = await client(GetFullChannelRequest(entity))
-        full_chat = full_info.full_chat
+        input_entity = await client.get_input_entity(chat_id)
+        full_info    = await client(GetFullChannelRequest(input_entity))
+        full_chat    = full_info.full_chat
         if hasattr(full_chat, "call") and full_chat.call:
             await client(LeaveGroupCallRequest(call=full_chat.call, source=0))
             log.info(f"vc_leave: {nom} ✅ chiqdi")
@@ -385,8 +425,19 @@ async def _get_client(akk_id: int) -> TelegramClient | None:
                 return None
             me = await c.get_me()
             log.info(f"[get_client] akk={akk_id} ✅ @{me.username or me.id}")
+
+            # user_id cache — event handler da get_me() chaqirmaslik uchun
+            _client_user_ids[akk_id] = me.id
+
             clients[akk_id] = c
-            await _handlerlarni_qoshish(akk_id, c)
+
+            # Handler FAQAT BIR MARTA qo'shiladi
+            if akk_id not in _handlers_qoshilgan:
+                await _handlerlarni_qoshish(akk_id, c)
+                _handlers_qoshilgan.add(akk_id)
+            else:
+                log.info(f"[get_client] akk={akk_id} handler allaqachon bor, o'tkazildi")
+
             return c
         except Exception as e:
             err = str(e)
@@ -394,6 +445,8 @@ async def _get_client(akk_id: int) -> TelegramClient | None:
                 log.warning(f"[get_client] akk={akk_id} AUTH_KEY_DUPLICATED — {urinish+1}/3 urinish, 10s kutilmoqda...")
                 try: await c.disconnect()
                 except: pass
+                _handlers_qoshilgan.discard(akk_id)
+                _client_user_ids.pop(akk_id, None)
                 await asyncio.sleep(10)
                 continue
             log.error(f"[get_client] akk={akk_id} XATO: {e}")
@@ -658,7 +711,11 @@ async def _la_saqlash(msg, state, akk_id, client):
         "UPDATE accounts SET display_name=COALESCE(NULLIF(display_name,''), $1) WHERE id=$2",
         nom, akk_id
     )
-    await _handlerlarni_qoshish(akk_id, client)
+    _client_user_ids[akk_id] = men.id
+    clients[akk_id] = client
+    if akk_id not in _handlers_qoshilgan:
+        await _handlerlarni_qoshish(akk_id, client)
+        _handlers_qoshilgan.add(akk_id)
     malumot = await state.get_data()
     await state.update_data(ok=malumot.get("ok",0)+1, idx=malumot.get("idx",0)+1)
     await state.set_state(None)
@@ -728,6 +785,8 @@ async def cmd_reset_sessions(msg: Message, state: FSMContext):
         try: await c.disconnect()
         except: pass
     clients.clear()
+    _handlers_qoshilgan.clear()
+    _client_user_ids.clear()
     r = await pool.execute("UPDATE accounts SET session_string=NULL, status='idle'")
     n = r.split()[-1] if r else "?"
     await msg.answer(
@@ -1025,7 +1084,11 @@ async def _ses_saqlash(msg: Message, state: FSMContext, akk_id: int, client: Tel
         avto_nom, akk_id
     )
     await state.clear()
-    await _handlerlarni_qoshish(akk_id, client)
+    _client_user_ids[akk_id] = men.id
+    clients[akk_id] = client
+    if akk_id not in _handlers_qoshilgan:
+        await _handlerlarni_qoshish(akk_id, client)
+        _handlers_qoshilgan.add(akk_id)
     await msg.answer(
         f"✅ <b>{avto_nom}</b> — session saqlandi!\n"
         f"📱 <code>{men.phone}</code>\n"
@@ -1049,6 +1112,8 @@ async def akkunt_ochir(cb: CallbackQuery):
         try: await clients[aid].disconnect()
         except: pass
         del clients[aid]
+    _handlers_qoshilgan.discard(aid)
+    _client_user_ids.pop(aid, None)
     if aid in vc_sessions:
         ses = vc_sessions[aid]
         t = ses.get("task")
@@ -1184,7 +1249,9 @@ async def nom_qabul(msg: Message, state: FSMContext):
     await state.clear()
     client = clients.get(akk_id)
     if client:
-        await _handlerlarni_qoshish(akk_id, client)
+        if akk_id not in _handlers_qoshilgan:
+            await _handlerlarni_qoshish(akk_id, client)
+            _handlers_qoshilgan.add(akk_id)
         log.info(f"[nom_qabul] akk={akk_id} handler qo'shildi, client bor")
     else:
         log.warning(f"[nom_qabul] akk={akk_id} clients da yo'q, DB dan yuklanmoqda...")
@@ -1891,19 +1958,23 @@ async def vc_chiqar_hammasi(cb: CallbackQuery):
     except Exception:
         pass
 
+    # Snapshot — tasklarni bekor qilishdan OLDIN olamiz
+    snapshot = list(vc_sessions.items())
+
     # Tasklarni bekor qilamiz
-    for ses in list(vc_sessions.values()):
+    all_tasks = []
+    for akk_id, ses in snapshot:
         t = ses.get("task")
         if t and not t.done():
             t.cancel()
+            all_tasks.append(t)
 
-    all_tasks = [ses["task"] for ses in list(vc_sessions.values()) if ses.get("task")]
     if all_tasks:
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    # VC dan chiqamiz
+    # VC dan chiqamiz (snapshot dan — vc_sessions allaqachon bo'sh bo'lishi mumkin)
     leave_tasks = []
-    for akk_id, ses in list(vc_sessions.items()):
+    for akk_id, ses in snapshot:
         client = clients.get(akk_id)
         if client and client.is_connected():
             chat_id = ses.get("chat_id")
@@ -1920,9 +1991,9 @@ async def vc_chiqar_hammasi(cb: CallbackQuery):
         except asyncio.TimeoutError:
             log.warning("vc_chiqar_hammasi: timeout")
 
-    # DB ni yangilaymiz
+    # DB ni yangilaymiz (snapshot dan)
     pool = await db.get_pool()
-    for akk_id in list(vc_sessions.keys()):
+    for akk_id, _ in snapshot:
         try:
             await pool.execute("UPDATE accounts SET status='idle' WHERE id=$1", akk_id)
         except Exception:
@@ -2075,14 +2146,17 @@ async def _vc_join_one(client: TelegramClient, entity):
 
 async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int, nom: str):
     """
-    VC da ushlab turish — task cancel bo'lganda chiqadi.
-    finally blokida HECH QANDAY chiqish qilinmaydi (tashqaridan boshqariladi).
+    VC da ushlab turish.
+    MUHIM: task cancel bo'lganda Telegram ga LeaveGroupCall YUBORILMAYDI.
+    Bu vazifani _hammani_boshat o'zi bajaradi (parallel, tezroq).
+    Faqat call serverda tugaganda (discarded) cleanup qiladi.
     """
     log.info(f"vc_keep_alive BOSHLANDI: {nom} (chat={chat_id})")
+    _cancelled = False
 
     try:
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(55)
 
             try:
                 input_entity = await client.get_input_entity(chat_id)
@@ -2091,92 +2165,135 @@ async def _vc_keep_alive(akk_id: int, client: TelegramClient, call, chat_id: int
 
                 if not (hasattr(full_chat, "call") and full_chat.call):
                     log.info(f"vc: {nom} — call tugadi (serverdan)")
-                    break
+                    break  # natural chiqish
 
-                me = await client.get_me()
-                try:
-                    gc_info = await client(GetGroupCallRequest(
-                        call=full_chat.call, limit=500
-                    ))
-                    user_ids = [
-                        p.peer.user_id
-                        for p in gc_info.participants
-                        if hasattr(p.peer, "user_id")
-                    ]
-                    if me.id not in user_ids:
-                        log.warning(f"vc: {nom} calldan chiqib ketgan — qayta kirilmoqda...")
-                        asyncio.create_task(
-                            _vc_qayta_kirish(akk_id, client, chat_id, nom)
+                # Cached user_id ishlatamiz — get_me() emas
+                my_id = _client_user_ids.get(akk_id)
+                if my_id:
+                    try:
+                        # limit=1000 — katta VC larda 500 yetmaydi
+                        gc_info = await client(GetGroupCallRequest(
+                            call=full_chat.call, limit=1000
+                        ))
+                        user_ids = set(
+                            p.peer.user_id
+                            for p in gc_info.participants
+                            if hasattr(p.peer, "user_id")
                         )
-                except Exception:
-                    pass
+                        if my_id not in user_ids:
+                            # faqat vc_sessions da bo'lsa qayta kiramiz
+                            if akk_id in vc_sessions:
+                                log.warning(f"vc: {nom} participant listdan yo'q — qayta kirilmoqda...")
+                                asyncio.create_task(_vc_qayta_kirish(akk_id, client, chat_id, nom))
+                    except Exception as e:
+                        log.debug(f"vc check participants {nom}: {e}")
+                    except Exception:
+                        pass
 
             except asyncio.CancelledError:
+                _cancelled = True
                 raise
             except Exception as e:
                 log.warning(f"vc check {nom}: {e} — davom")
                 continue
 
     except asyncio.CancelledError:
+        _cancelled = True
         log.info(f"vc_keep_alive CANCEL: {nom}")
-        raise  # muhim: re-raise qilamiz
+        raise
 
     finally:
-        # Faqat natural tugashda (call tugaganda) DB va sessions yangilanadi
-        # CancelledError holatida _hammani_boshat o'zi boshqaradi
-        log.info(f"vc_keep_alive FINALLY: {nom}")
+        log.info(f"vc_keep_alive FINALLY: {nom} (cancelled={_cancelled})")
         vc_sessions.pop(akk_id, None)
         if akk_id in vc_ping_tasks:
             vc_ping_tasks[akk_id].pop(chat_id, None)
-        try:
-            await db.update_account_status(akk_id, "idle")
-        except Exception:
-            pass
-        await db.add_log(akk_id, "vc_chiqdi", "call tugadi yoki bekor qilindi")
-        log.info(f"vc_keep_alive TUGADI: {nom}")
+
+        if not _cancelled:
+            # Natural tugash: call serverda tugadi → o'zimiz chiqib ketamiz + DB
+            await _vc_leave_safely(client, akk_id, chat_id, nom)
+            try:
+                await db.update_account_status(akk_id, "idle")
+            except Exception:
+                pass
+            await db.add_log(akk_id, "vc_chiqdi", "call serverda tugadi")
+            log.info(f"vc_keep_alive natural tugadi: {nom}")
+        # _cancelled=True → _hammani_boshat DB va leave ni o'zi bajaradi
 
 
 async def _vc_qayta_kirish(akk_id: int, client: TelegramClient, chat_id: int, nom: str):
-    await asyncio.sleep(2)
-    for urinish in range(5):
-        try:
-            input_entity = await client.get_input_entity(chat_id)
-            full_info    = await client(GetFullChannelRequest(input_entity))
-            full_chat    = full_info.full_chat
-            if not (hasattr(full_chat, "call") and full_chat.call):
-                log.info(f"vc qayta: {nom} — call tugagan")
+    """
+    VC dan o'zi chiqib ketsa qayta kirish.
+    Lock bilan — bir vaqtda faqat bitta rejoin urinishi.
+    MUHIM: vc_sessions da bo'lmasa ISHLAMAYDI (/stop dan keyin qayta kirmaslik uchun).
+    """
+    lock = _get_rejoin_lock(akk_id)
+
+    # Agar boshqa rejoin ketayotgan bo'lsa — o'tkazib yuboramiz
+    if lock.locked():
+        log.info(f"vc qayta: {nom} — allaqachon rejoin ketmoqda, o'tkazildi")
+        return
+
+    async with lock:
+        if akk_id not in vc_sessions:
+            log.info(f"vc qayta: {nom} — vc_sessions da yo'q, bekor")
+            return
+
+        await asyncio.sleep(3)
+
+        for urinish in range(5):
+            if akk_id not in vc_sessions:
+                log.info(f"vc qayta: {nom} — vc_sessions dan o'chirildi, to'xtatildi")
                 return
 
-            ssrc = random.randint(100_000_000, 999_999_999)
-            params = DataJSON(data=json.dumps({
-                "ufrag": f"uf{ssrc}", "pwd": f"pw{ssrc}",
-                "fingerprints": [{"hash": "sha-256", "fingerprint": "AA" * 32}],
-                "ssrc": ssrc, "ssrc-groups": []
-            }))
-            me = await client.get_input_entity("me")
-            await client(JoinGroupCallRequest(
-                call=full_chat.call, join_as=me, params=params,
-                muted=True, video_stopped=True, invite_hash=None
-            ))
+            try:
+                input_entity = await client.get_input_entity(chat_id)
+                full_info    = await client(GetFullChannelRequest(input_entity))
+                full_chat    = full_info.full_chat
+                if not (hasattr(full_chat, "call") and full_chat.call):
+                    log.info(f"vc qayta: {nom} — call tugagan")
+                    vc_sessions.pop(akk_id, None)
+                    try: await db.update_account_status(akk_id, "idle")
+                    except Exception: pass
+                    return
 
-            if akk_id in vc_sessions:
-                vc_sessions[akk_id]["call"] = full_chat.call
-                old_task = vc_sessions[akk_id]["task"]
-                if not old_task.done():
+                ssrc = random.randint(100_000_000, 999_999_999)
+                params = DataJSON(data=json.dumps({
+                    "ufrag": f"uf{ssrc}", "pwd": f"pw{ssrc}",
+                    "fingerprints": [{"hash": "sha-256", "fingerprint": "AA" * 32}],
+                    "ssrc": ssrc, "ssrc-groups": []
+                }))
+                me_input = await client.get_input_entity("me")
+                await client(JoinGroupCallRequest(
+                    call=full_chat.call, join_as=me_input, params=params,
+                    muted=True, video_stopped=True, invite_hash=None
+                ))
+
+                if akk_id not in vc_sessions:
+                    log.info(f"vc qayta: {nom} — kirdi lekin sessions yo'q, chiqilmoqda")
+                    await _vc_leave_safely(client, akk_id, chat_id, nom)
+                    return
+
+                old_task = vc_sessions[akk_id].get("task")
+                if old_task and not old_task.done():
                     old_task.cancel()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                 new_task = asyncio.create_task(
                     _vc_keep_alive(akk_id, client, full_chat.call, chat_id, nom)
                 )
                 vc_sessions[akk_id]["task"] = new_task
+                vc_sessions[akk_id]["call"] = full_chat.call
                 vc_ping_tasks[akk_id][chat_id] = new_task
 
-            log.info(f"vc qayta: {nom} ✅ qayta kirdi ({urinish + 1}-urinish)")
-            return
-        except Exception as e:
-            log.warning(f"vc qayta: {nom} {urinish + 1}-urinish xato: {e}")
-            await asyncio.sleep(3 * (urinish + 1))
-    log.error(f"vc qayta: {nom} 5 urinishdan keyin ham kira olmadi")
+                log.info(f"vc qayta: {nom} ✅ qayta kirdi ({urinish + 1}-urinish)")
+                return
+            except Exception as e:
+                log.warning(f"vc qayta: {nom} {urinish + 1}-urinish xato: {e}")
+                await asyncio.sleep(3 * (urinish + 1))
+
+        log.error(f"vc qayta: {nom} 5 urinishdan keyin kira olmadi")
+        vc_sessions.pop(akk_id, None)
+        try: await db.update_account_status(akk_id, "idle")
+        except Exception: pass
 
 
 async def _vc_bir_akkunt(akk: dict, link: str) -> tuple[bool, str]:
@@ -2207,14 +2324,15 @@ async def _vc_bir_akkunt(akk: dict, link: str) -> tuple[bool, str]:
         log.info(f"vc: {nom} — video chatga kirilmoqda...")
         call     = await _vc_join_one(client, entity)
         group_id = entity.id
+        norm_id  = _chat_id_normalize(group_id)
 
         task = asyncio.create_task(
-            _vc_keep_alive(akk_id, client, call, group_id, nom)
+            _vc_keep_alive(akk_id, client, call, norm_id, nom)
         )
-        vc_ping_tasks[akk_id][group_id] = task
+        vc_ping_tasks[akk_id][norm_id] = task
         vc_sessions[akk_id] = {
             "task":    task,
-            "chat_id": group_id,
+            "chat_id": norm_id,
             "call":    call,
             "nom":     nom,
             "akk_id":  akk_id,
@@ -2222,7 +2340,7 @@ async def _vc_bir_akkunt(akk: dict, link: str) -> tuple[bool, str]:
 
         await db.update_account_status(akk_id, "busy")
         await db.add_log(akk_id, "vc_kirdi", link)
-        log.info(f"vc: {nom} ✅ VIDEO CHATDA")
+        log.info(f"vc: {nom} ✅ VIDEO CHATDA (chat_id={norm_id})")
         return True, ""
 
     except FloodWaitError as e:
@@ -2272,27 +2390,28 @@ async def _vc_bir_akkunt_by_id(akk: dict, chat_id: int) -> tuple[bool, str]:
     """Bitta akkuntni chat_id orqali VC ga kiritish"""
     nom    = akk["display_name"] or akk["phone"]
     akk_id = akk["id"]
+    norm_id = _chat_id_normalize(chat_id)
 
     client = await _get_client(akk_id)
     if not client:
         return False, f"• {nom}: session yo'q"
 
     try:
-        input_entity = await client.get_input_entity(chat_id)
+        input_entity = await client.get_input_entity(norm_id)
         call   = await _vc_join_one(client, input_entity)
         task   = asyncio.create_task(
-            _vc_keep_alive(akk_id, client, call, chat_id, nom)
+            _vc_keep_alive(akk_id, client, call, norm_id, nom)
         )
-        vc_ping_tasks[akk_id][chat_id] = task
+        vc_ping_tasks[akk_id][norm_id] = task
         vc_sessions[akk_id] = {
             "task":    task,
-            "chat_id": chat_id,
+            "chat_id": norm_id,
             "call":    call,
             "nom":     nom,
             "akk_id":  akk_id,
         }
         await db.update_account_status(akk_id, "busy")
-        await db.add_log(akk_id, "vc_kirdi_auto", str(chat_id))
+        await db.add_log(akk_id, "vc_kirdi_auto", str(norm_id))
         return True, ""
     except FloodWaitError as e:
         return False, f"• {nom}: FloodWait {e.seconds}s"
@@ -2453,23 +2572,43 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
 
     @client.on(events.Raw())
     async def har_qanday_event(event):
+        """
+        UpdateGroupCallParticipants — faqat o'z akkuntimiz chiqib ketganini kuzatamiz.
+        MUHIM: event qaysi chatdan kelayotganini tekshiramiz.
+        """
         from telethon.tl.types import UpdateGroupCallParticipants
         if not isinstance(event, UpdateGroupCallParticipants):
             return
         try:
+            my_id = _client_user_ids.get(akk_id)
+            if not my_id:
+                return
+
+            # Event qaysi chatdan? call.id orqali vc_sessions dagi callni topamiz
+            event_call_id = getattr(getattr(event, "call", None), "id", None)
+            if not event_call_id:
+                return
+
+            # Bu akkuntning aktiv sessiyasini topamiz
+            ses = vc_sessions.get(akk_id)
+            if not ses:
+                return
+
+            # Sessiyaning call id bilan mosligini tekshiramiz
+            ses_call = ses.get("call")
+            ses_call_id = getattr(ses_call, "id", None)
+            if ses_call_id and ses_call_id != event_call_id:
+                return  # Boshqa chatning eventi — e'tibor bermaymiz
+
             for p in event.participants:
-                if getattr(p, "left", False):
-                    me = await client.get_me()
-                    if p.peer and hasattr(p.peer, "user_id") and p.peer.user_id == me.id:
-                        for aid, ses in list(vc_sessions.items()):
-                            c2 = clients.get(aid)
-                            if c2 is client:
-                                nom = ses.get("nom", str(aid))
-                                log.warning(f"vc: {nom} chiqib ketdi — qayta kirilmoqda...")
-                                asyncio.create_task(
-                                    _vc_qayta_kirish(aid, c2, ses["chat_id"], nom)
-                                )
-                                break
+                if not getattr(p, "left", False):
+                    continue
+                if not (p.peer and hasattr(p.peer, "user_id") and p.peer.user_id == my_id):
+                    continue
+                nom_local = ses.get("nom", str(akk_id))
+                log.warning(f"vc: {nom_local} o'zi chiqib ketdi (UpdateGroupCallParticipants) — qayta kirilmoqda...")
+                asyncio.create_task(_vc_qayta_kirish(akk_id, client, ses["chat_id"], nom_local))
+                break
         except Exception:
             pass
 
@@ -2481,17 +2620,29 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
             if chat_id is None: return
             if not isinstance(call, GroupCall): return
 
-            neg_chat_id = int(f"-100{chat_id}") if chat_id > 0 else chat_id
+            neg_chat_id = _chat_id_normalize(chat_id)
             discarded   = getattr(call, "discarded", False)
 
             if discarded:
                 chiqarildi = 0
+                affected_ids = []
                 for aid, ses in list(vc_sessions.items()):
-                    if ses["chat_id"] in (chat_id, neg_chat_id, abs(chat_id)):
+                    if _chat_id_mos(ses["chat_id"], chat_id):
                         t = ses.get("task")
-                        if t and not t.done():
-                            t.cancel()
+                        if t and not t.done(): t.cancel()
+                        affected_ids.append(aid)
                         chiqarildi += 1
+
+                # DB va sessions tozalash
+                if affected_ids:
+                    pool = await db.get_pool()
+                    for aid in affected_ids:
+                        vc_sessions.pop(aid, None)
+                        try:
+                            await pool.execute("UPDATE accounts SET status='idle' WHERE id=$1", aid)
+                        except Exception:
+                            pass
+
                 if chiqarildi:
                     log.info(f"VC tugadi chat={neg_chat_id}, {chiqarildi} akkunt chiqarildi")
                     await adminlarga_xabar(
@@ -2510,7 +2661,7 @@ async def _handlerlarni_qoshish(akk_id: int, client: TelegramClient):
                 _yuborilgan_vc_xabarlar.clear()
 
             guruhlar  = await db.get_monitored_groups()
-            guruh     = next((g for g in guruhlar if g["group_id"] in (chat_id, neg_chat_id)), None)
+            guruh     = next((g for g in guruhlar if _chat_id_mos(g["group_id"], chat_id)), None)
             guruh_nom = guruh["group_name"] if guruh else None
             if not guruh_nom:
                 try:
@@ -2593,6 +2744,8 @@ async def _qayta_ulanish_tsikl():
                     if "AUTH_KEY_DUPLICATED" in err:
                         log.warning(f"[qayta] akk={akk_id} AUTH_KEY_DUPLICATED — 15s keyin qayta urinish")
                         del clients[akk_id]
+                        _handlers_qoshilgan.discard(akk_id)
+                        _client_user_ids.pop(akk_id, None)
                         await asyncio.sleep(15)
                         await _get_client(akk_id)
                     else:
